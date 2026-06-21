@@ -1,0 +1,68 @@
+# 🐍 Python
+__pycache__/
+*.pyc
+*.pyo
+*.pyd
+.Python
+env/
+venv/
+.venv/
+pip-log.txt
+pip-delete-this-directory.txt
+.toast
+.spider
+.ipynb_checkpoints/
+.eggs/
+.egg-info/
+build/
+dist/
+*.egg-info/
+*.egg
+manifest
+.installed.cfg
+
+# 🧪 Testing & Coverage
+.pytest_cache/
+.tox/
+.coverage
+.coverage.*
+.cache
+nosetests.xml
+coverage.xml
+*,cover
+.hypothesis/
+htmlcov/
+
+# 🔑 Environment & Secrets
+.env
+.env.local
+.env.*
+!.env.example
+
+# ⚙️ Editor / IDE Configs
+.vscode/
+.idea/
+*.suo
+*.ntvs*
+*.njsproj
+*.sln
+*.swp
+*.swo
+
+# 💻 OS Files
+.DS_Store
+.DS_Store?
+._*
+Thumbs.db
+ehthumbs.db
+
+# ♟️ Chess Engines & Binaries
+stockfish
+stockfish.exe
+stockfish-*
+stockfish_*
+*.bin
+*.exe
+*.dll
+*.so
+*.dylib

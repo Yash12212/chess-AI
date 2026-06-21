@@ -1,0 +1,10 @@
+# pyrefly.toml
+disable-type-errors-in-ide = false
+
+project-excludes = [
+    "**/__pyrefly_virtual__/**",
+    "**/inmemory/**",
+    "/__pyrefly_virtual__/**",
+    "__pyrefly_virtual__/**",
+    "inmemory/**"
+]
