@@ -944,7 +944,7 @@ HTML = r"""
       const el = $('coach-content');
       if (!el) return;
       if (!s || currentIndex === 0) {
-        el.innerHTML = `<span class="text-neutral-400 italic">Select a move to receive grandmaster level coaching and strategic tips from Qwen!</span>`;
+        el.innerHTML = `<span class="text-neutral-400 italic">Select a move to receive grandmaster level coaching and strategic tips from AI!</span>`;
         return;
       }
       if (s.insightLoading && !s.insight) {
