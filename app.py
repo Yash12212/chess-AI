@@ -1,109 +1,79 @@
 # app.py
-import os
-import re
-import json
-import math
-import shutil
-import threading
-import traceback
-import logging
+import os, re, json, math, shutil, sys, threading, traceback, logging, warnings
 from pathlib import Path
 
-# External libraries
 from flask import Flask, request, jsonify, render_template_string, Response
 import chess
 import chess.engine
 import ollama
 
-# Google GenAI library (optional)
 try:
     from google import genai
     from google.genai import types
 except ImportError:
-    genai = None
-    types = None
+    genai = types = None
 
-# Local modules
 from expert_system import prepare_coach_context, clean_meta_text, get_annotations
 
-# Configure Colored Logging
-class ColoredFormatter(logging.Formatter):
-    grey = "\x1b[38;20m"
-    cyan = "\x1b[36;20m"
-    green = "\x1b[32;20m"
-    yellow = "\x1b[33;20m"
-    red = "\x1b[31;20m"
-    bold_red = "\x1b[31;1m"
-    reset = "\x1b[0m"
-    
-    log_format = "%(asctime)s | %(levelname)-8s | %(name)s | %(message)s"
-
-    FORMATS = {
-        logging.DEBUG: grey + log_format + reset,
-        logging.INFO: green + log_format + reset,
-        logging.WARNING: yellow + log_format + reset,
-        logging.ERROR: red + log_format + reset,
-        logging.CRITICAL: bold_red + log_format + reset
-    }
-
-    def format(self, record):
-        log_fmt = self.FORMATS.get(record.levelno, self.log_format)
-        formatter = logging.Formatter(log_fmt, datefmt="%Y-%m-%d %H:%M:%S")
-        return formatter.format(record)
-
-logger_parent = logging.getLogger("chess_ai")
-logger_parent.setLevel(logging.DEBUG)
-
-ch = logging.StreamHandler()
-ch.setLevel(logging.DEBUG)
-ch.setFormatter(ColoredFormatter())
-logger_parent.addHandler(ch)
-logger_parent.propagate = False
-
-logger = logging.getLogger("chess_ai.app")
-
-# Suppress noisy external library warnings
-logging.getLogger("chess.engine").setLevel(logging.ERROR)
-import warnings
 warnings.filterwarnings("ignore", message=".*null moves.*")
 
-def log_box(title, message, color_code="36"):
-    lines = str(message).strip().split('\n')
-    border = f"\x1b[{color_code};1m"
-    reset = "\x1b[0m"
-    out = [f"\n{border}┌── {title} " + "─" * max(0, 60 - len(title)) + reset]
-    for line in lines:
-        out.append(f"{border}│{reset} {line}")
-    out.append(f"{border}└" + "─" * 64 + reset)
-    return "\n".join(out)
+# ── Logging ───────────────────────────────────────────────────────────
+LOG_FMT = "%(asctime)s | %(levelname)-8s | %(name)s | %(message)s"
+LEVEL_COLORS = {logging.DEBUG: "38;20", logging.INFO: "32;20", logging.WARNING: "33;20",
+                logging.ERROR: "31;20", logging.CRITICAL: "31;1"}
 
-if genai is None or types is None:
+class ColoredFormatter(logging.Formatter):
+    def format(self, record):
+        color = LEVEL_COLORS.get(record.levelno, "38;20")
+        fmt = f"\x1b[{color}m{LOG_FMT}\x1b[0m"
+        return logging.Formatter(fmt, datefmt="%Y-%m-%d %H:%M:%S").format(record)
+
+root = logging.getLogger("chess_ai")
+root.setLevel(logging.DEBUG)
+root.propagate = False
+_h = logging.StreamHandler()
+_h.setLevel(logging.DEBUG)
+_h.setFormatter(ColoredFormatter())
+root.addHandler(_h)
+logging.getLogger("chess.engine").setLevel(logging.ERROR)
+
+logger = logging.getLogger("chess_ai.app")
+if genai is None:
     logger.error("Failed to import google-genai library.")
 
 
-# Try to load env variables from a local .env file if it exists
+def log_box(title, message, color="36"):
+    b, r = f"\x1b[{color};1m", "\x1b[0m"
+    lines = str(message).strip().split('\n')
+    parts = [f"\n{b}┌── {title} " + "─" * max(0, 60 - len(title)) + r]
+    parts += [f"{b}│{r} {ln}" for ln in lines]
+    parts.append(f"{b}└" + "─" * 64 + r)
+    return "\n".join(parts)
+
+
+# ── Env & Config ──────────────────────────────────────────────────────
 def load_env():
-    env_path = Path(".env")
-    if env_path.exists():
-        try:
-            with open(env_path, "r", encoding="utf-8") as f:
-                for line in f:
-                    line = line.strip()
-                    if not line or line.startswith("#"):
-                        continue
-                    if "=" in line:
-                        key, val = line.split("=", 1)
-                        # Strip quotes if present
-                        val = val.strip().strip("'\"")
-                        os.environ[key.strip()] = val
-        except Exception as e:
-            logger.error("Error loading .env file: %s", e)
+    p = Path(".env")
+    if not p.exists():
+        return
+    try:
+        for line in p.read_text(encoding="utf-8").splitlines():
+            line = line.strip()
+            if not line or line.startswith("#") or "=" not in line:
+                continue
+            k, v = line.split("=", 1)
+            os.environ[k.strip()] = v.strip().strip("'\"")
+    except Exception as e:
+        logger.error("Error loading .env file: %s", e)
 
 load_env()
 
-app = Flask(__name__)
+LLM_PROVIDER = (os.environ.get("LLM_PROVIDER") or "none").lower().strip()
+OLLAMA_HOST = os.environ.get("OLLAMA_HOST", "http://localhost:11434")
+OLLAMA_MODEL = os.environ.get("OLLAMA_MODEL")
+GEMINI_API_KEY = os.environ.get("GEMINI_API_KEY")
+GEMINI_MODEL = os.environ.get("GEMINI_MODEL")
 
-# ── Config ────────────────────────────────────────────────────────────
 SF_DEPTH, SF_TIME, SF_THREADS, SF_HASH = 20, 0.20, 2, 256
 WIN_PROB_K = 0.00368208
 EP_THRESH = [(0.02, "excellent"), (0.05, "good"), (0.10, "inaccuracy"), (0.20, "mistake")]
@@ -111,52 +81,29 @@ MISS_WIN_MIN, MISS_PLAY_MAX = 0.70, 0.55
 PVAL = {chess.PAWN: 1, chess.KNIGHT: 3, chess.BISHOP: 3, chess.ROOK: 5, chess.QUEEN: 9, chess.KING: 100}
 openings_db = {}
 
+
+def die(msg):
+    print(f"\nCONFIGURATION ERROR: {msg}\n", file=sys.stderr)
+    sys.exit(1)
+
+
 def validate_config():
-    import sys
-    # Check if .env file exists and/or environment variables are configured
     if not Path(".env").exists() and not os.environ.get("LLM_PROVIDER"):
-        print("\n" + "="*80, file=sys.stderr)
-        print(" CONFIGURATION ERROR: '.env' file not found.", file=sys.stderr)
-        print(" Please copy '.env.example' to '.env' and configure your settings:", file=sys.stderr)
-        print("   Windows:      copy .env.example .env", file=sys.stderr)
-        print("   macOS/Linux:  cp .env.example .env", file=sys.stderr)
-        print("="*80 + "\n", file=sys.stderr)
-        sys.exit(1)
-
-    provider = os.environ.get("LLM_PROVIDER")
-    if not provider:
-        print("CONFIGURATION ERROR: LLM_PROVIDER is not set in environment or .env file.", file=sys.stderr)
-        sys.exit(1)
-
-    provider = provider.lower().strip()
-    if provider not in ["local", "google"]:
-        print(f"CONFIGURATION ERROR: Invalid LLM_PROVIDER '{provider}'. Must be 'local' or 'google'.", file=sys.stderr)
-        sys.exit(1)
-
-    if provider == "local":
-        if not os.environ.get("OLLAMA_MODEL"):
-            print("CONFIGURATION ERROR: OLLAMA_MODEL is not set. Please define it in your .env file (e.g., OLLAMA_MODEL=qwen3.5:0.8b).", file=sys.stderr)
-            sys.exit(1)
-    elif provider == "google":
-        if not os.environ.get("GEMINI_API_KEY"):
-            print("CONFIGURATION ERROR: GEMINI_API_KEY is not set. Please define it in your .env file.", file=sys.stderr)
-            sys.exit(1)
-        if not os.environ.get("GEMINI_MODEL"):
-            print("CONFIGURATION ERROR: GEMINI_MODEL is not set. Please define it in your .env file (e.g., GEMINI_MODEL=gemini-3.1-flash-lite).", file=sys.stderr)
-            sys.exit(1)
+        die("'.env' file not found. Copy .env.example to .env and configure it.")
+    provider = (os.environ.get("LLM_PROVIDER") or "").lower().strip()
+    if provider in ("none", "disabled", "null", "false", ""):
+        return
+    if provider not in ("local", "google"):
+        die(f"Invalid LLM_PROVIDER '{provider}'. Must be 'local', 'google', or 'none'.")
+    if provider == "local" and not OLLAMA_MODEL:
+        die("OLLAMA_MODEL is not set. Define it in your .env file (e.g. OLLAMA_MODEL=qwen3.5:0.8b).")
+    if provider == "google":
+        if not GEMINI_API_KEY:
+            die("GEMINI_API_KEY is not set. Define it in your .env file.")
+        if not GEMINI_MODEL:
+            die("GEMINI_MODEL is not set. Define it in your .env file (e.g. GEMINI_MODEL=gemini-3.1-flash-lite).")
 
 validate_config()
-
-# LLM Provider: "local" (for Ollama) or "google" (for Google AI Studio API)
-LLM_PROVIDER = (os.environ.get("LLM_PROVIDER") or "local").lower().strip()
-
-# Ollama Settings (used if LLM_PROVIDER == "local")
-OLLAMA_HOST = os.environ.get("OLLAMA_HOST", "http://localhost:11434")
-OLLAMA_MODEL = os.environ.get("OLLAMA_MODEL")
-
-# Google AI Studio Settings (used if LLM_PROVIDER == "google")
-GEMINI_API_KEY = os.environ.get("GEMINI_API_KEY")
-GEMINI_MODEL = os.environ.get("GEMINI_MODEL")
 
 
 def sf_path():
@@ -166,8 +113,9 @@ def sf_path():
                 return str(p)
     except Exception as e:
         logger.error("Error scanning local files: %s", e)
-    paths = ["stockfish", "./stockfish", "/usr/games/stockfish", "/usr/bin/stockfish", "/opt/homebrew/bin/stockfish"]
-    return next((p for p in paths if shutil.which(p) or Path(p).exists()), "stockfish")
+    candidates = ["stockfish", "./stockfish", "/usr/games/stockfish",
+                  "/usr/bin/stockfish", "/opt/homebrew/bin/stockfish"]
+    return next((p for p in candidates if shutil.which(p) or Path(p).exists()), "stockfish")
 
 
 class EngineManager:
@@ -196,28 +144,33 @@ eng = EngineManager()
 
 # ── Openings DB ───────────────────────────────────────────────────────
 def norm_fen(fen, n=4):
-    p = fen.split()
-    return " ".join(p[:n]) if len(p) >= n else p[0]
+    parts = fen.split()
+    return " ".join(parts[:n]) if len(parts) >= n else parts[0]
 
 
 def load_openings():
     global openings_db
-    if Path("openings.json").exists():
-        try:
-            with open("openings.json", encoding="utf-8") as f:
-                for item in json.load(f):
-                    if (name := item.get("name")) and (fen := item.get("fen")):
-                        openings_db[norm_fen(fen, 4)] = name
-                        openings_db[norm_fen(fen, 1)] = name
-            logger.info("Loaded %d opening entries.", len(openings_db))
-        except Exception as e:
-            logger.error("Error loading openings.json: %s", e)
+    p = Path("openings.json")
+    if not p.exists():
+        return
+    try:
+        for item in json.loads(p.read_text(encoding="utf-8")):
+            name, fen = item.get("name"), item.get("fen")
+            if name and fen:
+                openings_db[norm_fen(fen, 4)] = name
+                openings_db[norm_fen(fen, 1)] = name
+        logger.info("Loaded %d opening entries.", len(openings_db))
+    except Exception as e:
+        logger.error("Error loading openings.json: %s", e)
 
 
 # ── Eval Helpers ──────────────────────────────────────────────────────
 def win_prob(v):
     try:
-        return 0.0 if (e := -WIN_PROB_K * v) > 700 else 1.0 if e < -700 else 1.0 / (1.0 + math.exp(e))
+        e = -WIN_PROB_K * v
+        if e > 700:  return 0.0
+        if e < -700: return 1.0
+        return 1.0 / (1.0 + math.exp(e))
     except OverflowError:
         return 0.0 if v < 0 else 1.0
 
@@ -237,11 +190,13 @@ def parse_eval(v):
 
 
 def analyze(board, multipv=1, t=SF_TIME):
-    if board.is_game_over(): return []
+    if board.is_game_over():
+        return []
     with eng.lock:
         r = eng.get().analyse(board, chess.engine.Limit(time=t, depth=SF_DEPTH), multipv=multipv)
         r = r if isinstance(r, list) else [r]
-        return [{"move": i.get("pv", [None])[0], "score": score_val(i["score"])} for i in r if i.get("pv") and i.get("score")]
+    return [{"move": i.get("pv", [None])[0], "score": score_val(i["score"])}
+            for i in r if i.get("pv") and i.get("score")]
 
 
 def eval_score(board):
@@ -250,14 +205,45 @@ def eval_score(board):
         return 0 if o.winner is None else ("M+0" if o.winner == chess.WHITE else "M-0")
     with eng.lock:
         s = eng.get().analyse(board, chess.engine.Limit(time=SF_TIME, depth=SF_DEPTH)).get("score")
-    if not s: return 0
+    if not s:
+        return 0
     if s.is_mate():
         m = s.white().mate()
         return 0 if m is None else f"M{'+' if m > 0 else ''}{m}"
     return v if (v := s.white().score()) is not None else 0
 
 
-# ── Routes ────────────────────────────────────────────────────────────
+def lpdo_circles(board):
+    """LPDO tracker: red circles on loose pieces (undefended, or attacked by a cheaper piece)
+    of the side to move."""
+    color, opp = board.turn, not board.turn
+    out = []
+    for sq in chess.SQUARES:
+        piece = board.piece_at(sq)
+        if not piece or piece.color != color or piece.piece_type == chess.KING:
+            continue
+        attacked = board.is_attacked_by(opp, sq)
+        undefended = attacked and not board.is_attacked_by(color, sq)
+        cheaper = attacked and any(
+            PVAL.get(board.piece_at(a).piece_type, 0) < PVAL.get(piece.piece_type, 0)
+            for a in board.attackers(opp, sq) if board.piece_at(a)
+        )
+        if undefended:
+            out.append({"orig": chess.square_name(sq), "brush": "red", "reason": "Undefended piece under attack"})
+        elif cheaper:
+            out.append({"orig": chess.square_name(sq), "brush": "red", "reason": "Piece attacked by lower-value piece"})
+    return out
+
+
+# ── Flask App ─────────────────────────────────────────────────────────
+app = Flask(__name__)
+
+
+def _classify_response(cls, ev, best, acc, arrows, circles, opening=None):
+    return jsonify({"classification": cls, "opening_name": opening, "eval": ev,
+                    "best_move": best, "move_accuracy": acc, "arrows": arrows, "circles": circles})
+
+
 @app.route("/")
 def index():
     return render_template_string(HTML)
@@ -265,9 +251,11 @@ def index():
 
 @app.route("/api/evaluate", methods=["POST"])
 def api_eval():
-    if not (fen := request.json.get("fen")): return jsonify({"error": "Missing FEN"}), 400
+    if not (fen := request.json.get("fen")):
+        return jsonify({"error": "Missing FEN"}), 400
     try:
-        return jsonify({"eval": eval_score(chess.Board(fen))})
+        board = chess.Board(fen)
+        return jsonify({"eval": eval_score(board), "circles": lpdo_circles(board)})
     except Exception as e:
         return jsonify({"error": str(e)}), 500
 
@@ -276,257 +264,191 @@ def api_eval():
 def api_classify():
     d = request.json
     prev_fen, uci = d.get("prev_fen"), d.get("move_uci")
-    if not prev_fen or not uci: return jsonify({"error": "Missing parameters"}), 400
+    if not prev_fen or not uci:
+        return jsonify({"error": "Missing parameters"}), 400
     try:
         bb = chess.Board(prev_fen)
         mv = chess.Move.from_uci(uci)
-        if mv not in bb.legal_moves: return jsonify({"error": "Illegal move"}), 400
+        if mv not in bb.legal_moves:
+            return jsonify({"error": "Illegal move"}), 400
 
         ba = bb.copy()
         ba.push(mv)
         ev = eval_score(ba)
 
-        # Retrieve structural arrows & circles from chess-detect helper
         ann = get_annotations(prev_fen, uci)
         arrows = ann.get("arrows", [])
-        circles = ann.get("circles", [])
+        circles = ann.get("circles", []) + lpdo_circles(ba)
 
-        if op := (openings_db.get(norm_fen(ba.fen(), 4)) or openings_db.get(norm_fen(ba.fen(), 1))):
-            return jsonify({"classification": "book", "opening_name": op, "eval": ev, "best_move": uci, "move_accuracy": 100.0, "arrows": arrows, "circles": circles})
-
+        opening = openings_db.get(norm_fen(ba.fen(), 4)) or openings_db.get(norm_fen(ba.fen(), 1))
+        if opening:
+            return _classify_response("book", ev, uci, 100.0, arrows, circles, opening)
         if bb.legal_moves.count() == 1:
-            return jsonify({"classification": "forced", "opening_name": None, "eval": ev, "best_move": uci, "move_accuracy": 100.0, "arrows": arrows, "circles": circles})
+            return _classify_response("forced", ev, uci, 100.0, arrows, circles)
 
-        if not (ab := analyze(bb, multipv=2)): return jsonify({"error": "Engine failed"}), 500
+        ab = analyze(bb, multipv=2)
+        if not ab:
+            return jsonify({"error": "Engine failed"}), 500
         best = ab[0]["move"]
         if not isinstance(best, chess.Move):
             return jsonify({"error": "Engine failed to return valid move"}), 500
-        
-        score_val_0 = ab[0]["score"]
-        if not isinstance(score_val_0, int):
+        sb = ab[0]["score"]
+        if not isinstance(sb, int):
             return jsonify({"error": "Engine failed to return valid score"}), 500
-        sb = score_val_0
+
         turn = bb.turn
         nps = parse_eval(ev)
-
         sa = nps if turn == chess.WHITE else -nps
         wp_b = win_prob(sb if turn == chess.WHITE else -sb)
         wp_a = win_prob(sa)
         xpl = max(0.0, wp_b - wp_a)
 
         acc = 100.0 if mv == best else max(0.0, min(100.0, 103.1668 * math.exp(-0.04354 * xpl * 100) - 3.1669))
-        sb1 = 0
-        if len(ab) > 1:
-            score_val_1 = ab[1]["score"]
-            if isinstance(score_val_1, int):
-                sb1 = score_val_1
+        sb1 = ab[1]["score"] if len(ab) > 1 and isinstance(ab[1]["score"], int) else 0
         great = mv == best and len(ab) > 1 and ((sb - sb1) if turn == chess.WHITE else (sb1 - sb)) >= 150
-
-        brilliant = False
-        pt = bb.piece_type_at(mv.from_square)
-        if mv == best and not bb.is_castling(mv) and pt is not None and pt != chess.KING:
-            to, opp = mv.to_square, not turn
-            if ba.is_attacked_by(opp, to):
-                atk_vals = []
-                for s in ba.attackers(opp, to):
-                    p = ba.piece_at(s)
-                    if p is not None:
-                        atk_vals.append(PVAL.get(p.piece_type, 1))
-                cap = bb.piece_at(to)
-                cap_val = 1 if bb.is_en_passant(mv) else (PVAL.get(cap.piece_type, 0) if cap else 0)
-                if PVAL[pt] - cap_val > 0 and (not ba.is_attacked_by(turn, to) or min(atk_vals, default=999) < PVAL[pt]):
-                    brilliant = sa >= -150
-
+        brilliant = _is_brilliant(bb, ba, mv, best, turn, sa)
         miss = mv != best and wp_b >= MISS_WIN_MIN and wp_a < MISS_PLAY_MAX
 
-        if brilliant: cls = "brilliant"
-        elif great: cls = "great"
-        elif miss: cls = "miss"
-        elif mv == best or xpl <= 0.0001: cls = "best"
-        else: cls = next((c for t, c in EP_THRESH if xpl <= t), "blunder")
+        if brilliant:                       cls = "brilliant"
+        elif great:                         cls = "great"
+        elif miss:                          cls = "miss"
+        elif mv == best or xpl <= 0.0001:   cls = "best"
+        else:                               cls = next((c for t, c in EP_THRESH if xpl <= t), "blunder")
 
-        return jsonify({"classification": cls, "opening_name": None, "eval": ev, "best_move": best.uci(), "move_accuracy": acc, "arrows": arrows, "circles": circles})
+        return _classify_response(cls, ev, best.uci(), acc, arrows, circles)
     except Exception as e:
         traceback.print_exc()
         return jsonify({"error": str(e)}), 500
 
+
+def _is_brilliant(bb, ba, mv, best, turn, sa):
+    """A best move that sacrifices material into a winning tactical sequence."""
+    if mv != best:
+        return False
+    pt = bb.piece_type_at(mv.from_square)
+    if bb.is_castling(mv) or pt is None or pt == chess.KING:
+        return False
+    opp, to = not turn, mv.to_square
+    if not ba.is_attacked_by(opp, to):
+        return False
+    atk_vals = [PVAL.get(ba.piece_at(s).piece_type, 1) for s in ba.attackers(opp, to) if ba.piece_at(s)]
+    cap = bb.piece_at(to)
+    cap_val = 1 if bb.is_en_passant(mv) else (PVAL.get(cap.piece_type, 0) if cap else 0)
+    return (PVAL[pt] - cap_val > 0
+            and (not ba.is_attacked_by(turn, to) or min(atk_vals, default=999) < PVAL[pt])
+            and sa >= -150)
+
+
+# ── Coach (LLM) ───────────────────────────────────────────────────────
+SYS_INTRO = "You are an objective chess analyst. Output exactly two sentences."
+SYS_OUTRO = "Output only the commentary."
+
+
+def build_coach_prompts(ctx):
+    p, m = ctx["player_color"], ctx["move_san"]
+    cls, ev, ev_desc = ctx["cls_label"], ctx["eval_str"], ctx["eval_desc"]
+    purpose, ref, best = ctx["move_purpose"], ctx["refutation_pv"], ctx["best_move_san"]
+    feats = ctx["features_block"]
+
+    def ev_phrase():
+        raw = ev.replace("+", "").replace("-", "").strip()
+        return "" if (raw and raw in ev_desc) else f" with an evaluation of {ev}"
+
+    if ctx.get("is_checkmate"):
+        sys_first = "State that checkmate has been delivered."
+        sys_second = "Confirm that this concludes the game."
+        instr = (f"1. State that {p} delivered checkmate with {m}.\n"
+                 f"2. Confirm that this concludes the game.")
+    elif ctx.get("is_forced_mate") and not ctx["is_bad_move"]:
+        sys_first = "Explain the forced checkmate sequence setup."
+        sys_second = "Note the forced checkmate valuation."
+        instr = (f"1. State that {p} played {m} to set up a forced mate.\n"
+                 f"2. Note that the evaluation is a forced checkmate ({ev}).")
+    elif ctx["is_bad_move"]:
+        sys_first = "Explain why the move is bad using the provided evaluation."
+        sys_second = "State the refutation sequence exactly as provided."
+        phrase = {"inaccuracy": "an inaccuracy", "mistake": "a mistake"}.get(cls, "a blunder")
+        lead = f"1. Explain that {p} played {m}, which is {phrase} because it {ev_desc}{ev_phrase()}.\n"
+        if any(k in feats for k in ["- Opponent Refutation:", "- Threat Created:"]):
+            instr = lead + f"2. Conclude by writing: The refutation is exactly: {ref}."
+        else:
+            instr = lead + f"2. State that '{best}' was the best alternative."
+    else:
+        sys_first = "Explain the move's purpose."
+        sys_second = "State the evaluation or immediate tactical benefit."
+        if any(k in feats for k in ["- Fork:", "- Rook:"]):
+            instr = (f"1. Explain that {p} played {m} to {purpose}.\n"
+                     f"2. Describe the benefit of {m} using the Fork or Rook details.")
+        else:
+            instr = (f"1. Explain that {p} played {m} to {purpose}.\n"
+                     f"2. State that this move {ev_desc}{ev_phrase()}.")
+
+    system_prompt = f"{SYS_INTRO} First sentence: {sys_first} Second sentence: {sys_second} {SYS_OUTRO}"
+    user_prompt = (f"Data:\n{feats}\n{ctx['eval_context']}\n\n"
+                   f"Instructions:\n{instr}\n\n"
+                   f"Rule: Write exactly two sentences. Never repeat the evaluation or its description. No meta-text.")
+    return system_prompt, user_prompt
+
+
+def _stream(iterable, log_title):
+    """Accumulate streamed chunks, yield them, and log the full response (or an error)."""
+    full = ""
+    try:
+        for chunk in iterable:
+            if chunk:
+                full += chunk
+                yield chunk
+        logger.info(log_box(log_title, full, "32"))
+    except Exception as e:
+        logger.error("Generator failed: %s", e)
+        yield f"\n[Coach Error: {e}]"
+
+
+def stream_google(system_prompt, prompt):
+    if not GEMINI_API_KEY or not GEMINI_MODEL:
+        yield "[Coach Error: Gemini API Key or Model is not configured.]"; return
+    if genai is None or types is None:
+        yield "[Coach Error: google-genai library not installed.]"; return
+    client = genai.Client(api_key=GEMINI_API_KEY)
+    resp = client.models.generate_content_stream(
+        model=GEMINI_MODEL, contents=prompt,
+        config=types.GenerateContentConfig(system_instruction=system_prompt,
+                                           temperature=0.1, max_output_tokens=150))
+    yield from _stream((chunk.text for chunk in resp if chunk.text), "GOOGLE AI STUDIO OUTPUT")
+
+
+def stream_ollama(system_prompt, prompt):
+    client = ollama.Client(host=OLLAMA_HOST)
+    kwargs = dict(model=OLLAMA_MODEL or "",
+                  messages=[{"role": "system", "content": system_prompt},
+                            {"role": "user", "content": prompt}],
+                  options={"temperature": 0.1, "num_predict": 150})
+    try:
+        stream = client.chat(think=False, stream=True, **kwargs)
+    except TypeError:                       # older ollama has no `think` kwarg
+        stream = client.chat(stream=True, **kwargs)
+
+    def chunks():
+        for chunk in stream:
+            msg = getattr(chunk, 'message', None) or chunk.get('message', {})
+            yield getattr(msg, 'content', None) or msg.get('content', '')
+    yield from _stream(chunks(), "LLM OUTPUT")
+
+
 @app.route("/api/coach", methods=["POST"])
 def api_coach():
+    if LLM_PROVIDER in ("none", "disabled", "null", "false"):
+        return Response(
+            "AI Coach is currently disabled. Set LLM_PROVIDER to 'google' or 'local' in your .env file to enable it.",
+            mimetype="text/plain")
+
     ctx = prepare_coach_context(request.json)
-    
-    move_san = ctx["move_san"]
-    best_move_san = ctx["best_move_san"]
-    cls_label = ctx["cls_label"]
-    eval_str = ctx["eval_str"]
-    eval_context = ctx["eval_context"]
-    features_block = ctx["features_block"]
-    player_color = ctx["player_color"]
-    eval_desc = ctx["eval_desc"]
-    move_purpose = ctx["move_purpose"]
-    ref_pv_line = ctx["refutation_pv"]
-    
-    is_checkmate = ctx.get("is_checkmate", False)
-    is_forced_mate = ctx.get("is_forced_mate", False)
-
-    # Compile structured instructions using standard numbering to bypass prefix echoing
-    if is_checkmate:
-        system_prompt = (
-            "You are an objective chess analyst. Output exactly two sentences. "
-            "First sentence: State that checkmate has been delivered. "
-            "Second sentence: Confirm that this concludes the game. Output only the commentary."
-        )
-        sentence_instructions = (
-            f"1. State that {player_color} delivered checkmate with {move_san}.\n"
-            f"2. Confirm that this concludes the game."
-        )
-    elif is_forced_mate and not ctx["is_bad_move"]:
-        system_prompt = (
-            "You are an objective chess analyst. Output exactly two sentences. "
-            "First sentence: Explain the forced checkmate sequence setup. "
-            "Second sentence: Note the forced checkmate valuation. Output only the commentary."
-        )
-        sentence_instructions = (
-            f"1. State that {player_color} played {move_san} to set up a forced mate.\n"
-            f"2. Note that the evaluation is a forced checkmate ({eval_str})."
-        )
-    elif ctx["is_bad_move"]:
-        system_prompt = (
-            "You are an objective chess analyst. Output exactly two sentences. "
-            "First sentence: Explain why the move is bad using the provided evaluation. "
-            "Second sentence: State the refutation sequence exactly as provided. Output only the commentary."
-        )
-        cls_phrase = "an inaccuracy" if cls_label == "inaccuracy" else ("a mistake" if cls_label == "mistake" else "a blunder")
-        
-        # Strip signs and decimals to find duplicates
-        raw_num = eval_str.replace("+", "").replace("-", "").strip()
-        eval_phrase = "" if (raw_num and raw_num in eval_desc) else f" with an evaluation of {eval_str}"
-        
-        has_details = any(k in features_block for k in ["- Opponent Refutation:", "- Threat Created:"])
-        
-        # Streamline standard grammatical descriptions to prevent duplicate stuttering
-        if has_details:
-            sentence_instructions = (
-                f"1. Explain that {player_color} played {move_san}, which is {cls_phrase} because it {eval_desc}{eval_phrase}.\n"
-                f"2. Conclude by writing: The refutation is exactly: {ref_pv_line}."
-            )
-        else:
-            sentence_instructions = (
-                f"1. Explain that {player_color} played {move_san}, which is {cls_phrase} because it {eval_desc}{eval_phrase}.\n"
-                f"2. State that '{best_move_san}' was the best alternative."
-            )
-    else:
-        system_prompt = (
-            "You are an objective chess analyst. Output exactly two sentences. "
-            "First sentence: Explain the move's purpose. "
-            "Second sentence: State the evaluation or immediate tactical benefit. Output only the commentary."
-        )
-        
-        has_details = any(k in features_block for k in ["- Fork:", "- Rook:"])
-        
-        raw_num = eval_str.replace("+", "").replace("-", "").strip()
-        eval_phrase = "" if (raw_num and raw_num in eval_desc) else f" with an evaluation of {eval_str}"
-        
-        if has_details:
-            sentence_instructions = (
-                f"1. Explain that {player_color} played {move_san} to {move_purpose}.\n"
-                f"2. Describe the benefit of {move_san} using the Fork or Rook details."
-            )
-        else:
-            sentence_instructions = (
-                f"1. Explain that {player_color} played {move_san} to {move_purpose}.\n"
-                f"2. State that this move {eval_desc}{eval_phrase}."
-            )
-
-    # Simplified user prompt block to optimize context space
-    prompt = (
-        f"Data:\n{features_block}\n"
-        f"{eval_context}\n\n"
-        f"Instructions:\n{sentence_instructions}\n\n"
-        f"Rule: Write exactly two sentences. Never repeat the evaluation or its description. No meta-text."
-    )
-
-    # --- Log Prompts to Console ---
+    system_prompt, prompt = build_coach_prompts(ctx)
     logger.debug(log_box(f"SYSTEM PROMPT SENT TO {LLM_PROVIDER.upper()}", system_prompt, "36"))
     logger.debug(log_box(f"USER PROMPT SENT TO {LLM_PROVIDER.upper()}", prompt, "33"))
 
-    def generate_tokens():
-        if LLM_PROVIDER == "google":
-            if not GEMINI_API_KEY or not GEMINI_MODEL:
-                yield "[Coach Error: Gemini API Key or Model is not configured.]"
-                return
-            if genai is None or types is None:
-                yield "[Coach Error: google-genai library not installed.]"
-                return
-            
-            try:
-                client = genai.Client(api_key=GEMINI_API_KEY)
-                response_stream = client.models.generate_content_stream(
-                    model=GEMINI_MODEL,
-                    contents=prompt,
-                    config=types.GenerateContentConfig(
-                        system_instruction=system_prompt,
-                        temperature=0.1,
-                        max_output_tokens=150
-                    )
-                )
-                full_response = ""
-                for chunk in response_stream:
-                    if chunk.text:
-                        full_response += chunk.text
-                        yield chunk.text
-                
-                # --- Log Output to Console ---
-                logger.info(log_box("GOOGLE AI STUDIO OUTPUT", full_response, "32"))
-            except Exception as e:
-                logger.error("Google AI Studio Generator failed: %s", e)
-                yield f"\n[Coach Error: {e}]"
-        else:
-            client = ollama.Client(host=OLLAMA_HOST)
-            full_response = ""
-            try:
-                model_name = OLLAMA_MODEL or ""
-                try:
-                    stream = client.chat(
-                        model=model_name,
-                        messages=[
-                            {"role": "system", "content": system_prompt},
-                            {"role": "user", "content": prompt}
-                        ],
-                        options={
-                            "temperature": 0.1,
-                            "num_predict": 150
-                        },
-                        stream=True,
-                        think=False
-                    )
-                except TypeError:
-                    stream = client.chat(
-                        model=model_name,
-                        messages=[
-                            {"role": "system", "content": system_prompt},
-                            {"role": "user", "content": prompt}
-                        ],
-                        options={
-                            "temperature": 0.1,
-                            "num_predict": 150
-                        },
-                        stream=True
-                    )
-
-                for chunk in stream:
-                    msg = getattr(chunk, 'message', None) or chunk.get('message', {})
-                    content = getattr(msg, 'content', None) or msg.get('content', '')
-                    if content:
-                        full_response += content
-                        yield content
-                
-                # --- Log Output to Console ---
-                logger.info(log_box("LLM OUTPUT", full_response, "32"))
-            except Exception as e:
-                logger.error("Generator failed: %s", e)
-                yield f"\n[Coach Error: {e}]"
-
-    return Response(generate_tokens(), mimetype="text/plain")
+    gen = stream_google(system_prompt, prompt) if LLM_PROVIDER == "google" else stream_ollama(system_prompt, prompt)
+    return Response(gen, mimetype="text/plain")
 
 
 # ── HTML / Frontend ───────────────────────────────────────────────────
@@ -856,8 +778,13 @@ HTML = r"""
       s.evalLoading = true;
       try {
         const r = await apiCall('/api/evaluate', {fen:s.fen});
-        s.eval = (await r.json()).eval || "0";
-        if (currentIndex===i) updateEvalMeter(s.eval);
+        const d = await r.json();
+        s.eval = d.eval || "0";
+        s.circles = d.circles || [];
+        if (currentIndex===i) {
+          updateEvalMeter(s.eval);
+          updateMarkings(s);
+        }
       } catch { if (currentIndex===i) updateEvalMeter(0); }
       s.evalLoading = false;
     };
@@ -966,18 +893,37 @@ HTML = r"""
 
     const updateMarkings = s => {
       $$('.classification-badge-wrapper').forEach(e=>e.remove());
-      if (!s) return ground.setShapes([]);
+      if (!s) {
+        window.currentBoardMarkings = [];
+        return ground.setShapes([]);
+      }
       const sh = [], to = s.move_uci?.slice(2,4);
       if (to && s.classification && !['loading','unknown'].includes(s.classification)) drawBadge(to, s.classification);
       
       // Draw standard best-move indicator
       if (s.best_move && s.move_uci && s.classification) {
         if (!['best','brilliant','great','forced','book'].includes(s.classification) && s.best_move !== s.move_uci) {
+          let bestMoveSan = s.best_move;
+          try {
+            const prevState = states[currentIndex - 1];
+            if (prevState) {
+              const temp = new Chess(prevState.fen);
+              const mv = temp.move({
+                from: s.best_move.slice(0,2),
+                to: s.best_move.slice(2,4),
+                promotion: s.best_move[4]
+              });
+              if (mv) bestMoveSan = mv.san;
+            }
+          } catch (e) {
+            console.error(e);
+          }
           sh.push({
             orig: s.best_move.slice(0,2),
             dest: s.best_move.slice(2,4),
             brush: 'green',
-            modifiers: { lineWidth: 10 }
+            modifiers: { lineWidth: 10 },
+            reason: `Best alternative move: ${bestMoveSan}`
           });
         }
       }
@@ -989,7 +935,8 @@ HTML = r"""
             orig: a.orig,
             dest: a.dest,
             brush: a.brush,
-            modifiers: { lineWidth: 8 }
+            modifiers: { lineWidth: 8 },
+            reason: a.reason
           });
         });
       }
@@ -999,11 +946,13 @@ HTML = r"""
         s.circles.forEach(c => {
           sh.push({
             orig: c.orig,
-            brush: c.brush
+            brush: c.brush,
+            reason: c.reason
           });
         });
       }
 
+      window.currentBoardMarkings = sh;
       ground.setShapes(sh);
     };
 
@@ -1237,6 +1186,108 @@ HTML = r"""
     });
     $('fen-input').addEventListener('keydown', e => e.key==='Enter' && loadCustomFen());
     window.addEventListener('resize', () => { ground && ground.redrawAll(); updateMarkings(states[currentIndex]); });
+
+    const getSquareCenter = (square, rect, o) => {
+      const col = square.charCodeAt(0) - 97;
+      const row = 8 - parseInt(square[1]);
+      const c = o ? col : 7 - col;
+      const r = o ? row : 7 - row;
+      const sqSize = rect.width / 8;
+      return {
+        x: rect.left + (c + 0.5) * sqSize,
+        y: rect.top + (r + 0.5) * sqSize
+      };
+    };
+
+    const distToSegment = (px, py, ax, ay, bx, by) => {
+      const dx = bx - ax;
+      const dy = by - ay;
+      const l2 = dx * dx + dy * dy;
+      if (l2 === 0) return Math.hypot(px - ax, py - ay);
+      let t = ((px - ax) * dx + (py - ay) * dy) / l2;
+      t = Math.max(0, Math.min(1, t));
+      return Math.hypot(px - (ax + t * dx), py - (ay + t * dy));
+    };
+
+    const showTooltip = (text, x, y) => {
+      let el = $('shapes-tooltip');
+      if (!el) {
+        el = Object.assign(document.createElement('div'), {
+          id: 'shapes-tooltip',
+          className: 'fixed z-[100] pointer-events-none bg-[#18181c]/95 border border-neutral-700/80 text-white text-xs px-2.5 py-1.5 rounded-lg shadow-xl font-sans font-semibold tracking-wide transition-opacity duration-150'
+        });
+        document.body.appendChild(el);
+      }
+      el.innerText = text;
+      el.style.opacity = '1';
+      
+      const rect = el.getBoundingClientRect();
+      let left = x + 15;
+      let top = y + 15;
+      if (left + rect.width > window.innerWidth) {
+        left = x - rect.width - 15;
+      }
+      if (top + rect.height > window.innerHeight) {
+        top = y - rect.height - 15;
+      }
+      el.style.left = `${left}px`;
+      el.style.top = `${top}px`;
+    };
+
+    const hideTooltip = () => {
+      const el = $('shapes-tooltip');
+      if (el) el.style.opacity = '0';
+    };
+
+    $('board').addEventListener('mousemove', e => {
+      const markings = window.currentBoardMarkings || [];
+      const rect = $('board').getBoundingClientRect();
+      if (!maxDistSquare(e, rect)) {
+        hideTooltip();
+        return;
+      }
+      
+      const o = ground.state.orientation === 'white';
+      const mx = e.clientX;
+      const my = e.clientY;
+      
+      let closestMarking = null;
+      let minDist = Infinity;
+      
+      markings.forEach(m => {
+        if (!m.reason) return;
+        
+        const centerOrig = getSquareCenter(m.orig, rect, o);
+        if (m.dest) {
+          const centerDest = getSquareCenter(m.dest, rect, o);
+          const d = distToSegment(mx, my, centerOrig.x, centerOrig.y, centerDest.x, centerDest.y);
+          if (d < minDist) {
+            minDist = d;
+            closestMarking = m;
+          }
+        } else {
+          const d = Math.hypot(mx - centerOrig.x, my - centerOrig.y);
+          if (d < minDist) {
+            minDist = d;
+            closestMarking = m;
+          }
+        }
+      });
+      
+      const threshold = 24;
+      if (closestMarking && minDist < threshold) {
+        showTooltip(closestMarking.reason, mx, my);
+      } else {
+        hideTooltip();
+      }
+    });
+
+    function maxDistSquare(e, rect) {
+      return (e.clientX >= rect.left && e.clientX <= rect.right &&
+              e.clientY >= rect.top && e.clientY <= rect.bottom);
+    }
+
+    $('board').addEventListener('mouseleave', hideTooltip);
 
     reset(); chess = new Chess(); initBoard(); updateBoard(); lucide.createIcons();
   </script>
