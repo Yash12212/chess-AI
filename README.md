@@ -69,7 +69,7 @@ Real-time Stockfish evaluation · 11-class move classification · tactical board
 
 1. **Clone and Enter Repository:**
    ```bash
-   git clone <your-repo-url> && cd "chess AI"
+   git clone https://github.com/Yash12212/chess-AI && cd "chess AI"
    ```
 
 2. **Initialize Environment:**
@@ -121,7 +121,7 @@ The application runs a pipeline composed of three cooperating systems: a **class
 
 When a move is played, it is sent to `/api/classify`. The backend queries Stockfish for a **multi-PV analysis** (the top 2 lines) and calculates the **win probability** using the Lichess model:
 
-$$\text{win\_prob}(\text{cp}) = \frac{1}{1 + e^{-0.00368208 \cdot \text{cp}}}$$
+$$\text{win\\_prob}(\text{cp}) = \frac{1}{1 + e^{-0.00368208 \cdot \text{cp}}}$$
 
 The difference in winning chance before and after the move ($\Delta \text{wp} = \text{wp}_{\text{before}} - \text{wp}_{\text{after}}$) determines the move classification:
 
@@ -319,8 +319,8 @@ flowchart TD
     NULLMOVE --> EXPLENG
     
     COACH --> FEATURES
-    COACH -.-->|Stream Tokens| OLLAMA
-    COACH -.-->|Stream Tokens| GEMINI
+    COACH -.->|Stream Tokens| OLLAMA
+    COACH -.->|Stream Tokens| GEMINI
 ```
 
 ### 🔧 Key Design Points
