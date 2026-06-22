@@ -1,0 +1,23 @@
+---
+
+### Tier 1: "Quick Wins" (High Gain, Tiny Code Footprint)
+These features require fewer than 20 lines of simple Python code using built-in `python-chess` functions, yet they provide massive coaching and visual value.
+
+| Priority | Feature | Est. Code Size | Analytical Gain | Implementation Heuristic |
+| :--- | :--- | :---: | :---: | :--- |
+| **1** | **Multi-Candidate Engine Paths** | ~10 lines | **Extreme** | You already have an engine setup. Simply change `multipv=1` to `multipv=3` in your `analyze()` function. Return the top 3 moves as arrows with distinct colors (e.g., Green for #1, Yellow/Green for #2, Orange for #3). |
+| **2** | **Loose Pieces (LPDO) Tracker** | ~12 lines | **Very High** | Iterate over all occupied squares of the active color. Use `board.is_attacked_by(not color, sq)` and check if `not board.is_attacked_by(color, sq)`. If true, highlight the square with a red circle. Amateur players blunder undefended pieces constantly. |
+| **3** | **Long-Range Sniper Warnings** | ~15 lines | **Very High** | Scan sliding pieces (B, R, Q). Use ray attacks to see if a piece’s attack path to an enemy high-value target is blocked by *exactly one* piece. If that intermediate piece moves, it's a discovered attack. Draw a dotted red arrow. |
+| **4** | **Outpost Square Finder** | ~15 lines | **High** | Define outposts: Squares on ranks 4–6 (or 3–5 for Black) that cannot be attacked by enemy pawns (easily checked using adjacent files) and can be occupied by a friendly minor piece. Draw a green circle on the square. |
+
+---
+
+### Tier 2: "High Value, Moderate Code" (Great Gain, Medium Complexity)
+These features require slightly more conditional logic (30–50 lines of Python), but remain highly self-contained and introduce no external dependencies.
+
+| Priority | Feature | Est. Code Size | Analytical Gain | Implementation Heuristic |
+| :--- | :--- | :---: | :---: | :--- |
+| **5** | **The "Rule of the Square" Visualizer** | ~20 lines | **High** | In endgames with no other active pieces, detect a passed pawn. Let $D$ be the distance (ranks) to promotion. Draw a bounding box of size $D \times D$ from the pawn to the promotion rank. Draw a colored border around this square to show if the defending King can catch it. |
+| **6** | **Escape Squares ("Luft" Alarm)** | ~25 lines | **Medium-High** | Check if the King is castled and the back rank is vulnerable to mate. Check the three squares in front of the King (e.g., f2/g2/h2 for White). If none have advanced, draw a red warning circle on the back rank and a green circle on the ideal pawn-push square. |
+| **7** | **Overloaded Defenders** | ~35 lines | **High** | Find all friendly pieces under attack. For each, grab the set of defending pieces. If the intersection of these defender sets reveals a single piece defending two or more attacked targets, highlight that overloaded defender in yellow with dashed arrows pointing to its duties. |
+| **8** | **Knight Maneuvering Route Guide** | ~40 lines | **Medium** | If an outpost square is identified (from Tier 1) and a friendly knight is on the board, use a simple Breadth-First Search (BFS) of knight jumps to find the shortest path (typically 2-3 moves) to the outpost. Draw numbered, curved green arrows. |
