@@ -69,7 +69,7 @@ Real-time Stockfish evaluation · 11-class move classification · tactical board
 
 1. **Clone and Enter Repository:**
    ```bash
-   git clone <your-repo-url> && cd "chess AI"
+   git clone https://github.com/Yash12212/chess-AI && cd "chess AI"
    ```
 
 2. **Initialize Environment:**
@@ -319,8 +319,8 @@ flowchart TD
     NULLMOVE --> EXPLENG
     
     COACH --> FEATURES
-    COACH -.-->|Stream Tokens| OLLAMA
-    COACH -.-->|Stream Tokens| GEMINI
+    COACH -.->|Stream Tokens| OLLAMA
+    COACH -.->|Stream Tokens| GEMINI
 ```
 
 ### 🔧 Key Design Points
