@@ -1,23 +1,81 @@
----
-
-### Tier 1: "Quick Wins" (High Gain, Tiny Code Footprint)
-These features require fewer than 20 lines of simple Python code using built-in `python-chess` functions, yet they provide massive coaching and visual value.
-
-| Priority | Feature | Est. Code Size | Analytical Gain | Implementation Heuristic |
-| :--- | :--- | :---: | :---: | :--- |
-| **1** | **Multi-Candidate Engine Paths** | ~10 lines | **Extreme** | You already have an engine setup. Simply change `multipv=1` to `multipv=3` in your `analyze()` function. Return the top 3 moves as arrows with distinct colors (e.g., Green for #1, Yellow/Green for #2, Orange for #3). |
-| **2** | **Loose Pieces (LPDO) Tracker** | ~12 lines | **Very High** | Iterate over all occupied squares of the active color. Use `board.is_attacked_by(not color, sq)` and check if `not board.is_attacked_by(color, sq)`. If true, highlight the square with a red circle. Amateur players blunder undefended pieces constantly. |
-| **3** | **Long-Range Sniper Warnings** | ~15 lines | **Very High** | Scan sliding pieces (B, R, Q). Use ray attacks to see if a piece’s attack path to an enemy high-value target is blocked by *exactly one* piece. If that intermediate piece moves, it's a discovered attack. Draw a dotted red arrow. |
-| **4** | **Outpost Square Finder** | ~15 lines | **High** | Define outposts: Squares on ranks 4–6 (or 3–5 for Black) that cannot be attacked by enemy pawns (easily checked using adjacent files) and can be occupied by a friendly minor piece. Draw a green circle on the square. |
+Here is a modular, granular roadmap broken down into smaller, independent phases. Each phase is self-contained, has a single responsibility, and can be developed, tested, and deployed individually without relying heavily on subsequent phases.
 
 ---
 
-### Tier 2: "High Value, Moderate Code" (Great Gain, Medium Complexity)
-These features require slightly more conditional logic (30–50 lines of Python), but remain highly self-contained and introduce no external dependencies.
+### Phase 1: Stockfish `eval` Parser
+*   **Objective:** Extract classical positional metrics from the engine.
+*   **Technical Implementation:** 
+    *   Create a backend utility to send the raw `eval` command to Stockfish during a static position lookup.
+    *   Write a text parser to convert the engine's stdout structure (Material, Imbalance, Pawn Structure, King Safety, Space) into a standardized Python dictionary.
+*   **Deliverable:** A backend JSON payload returning:
+    ```json
+    { "positional_balance": { "king_safety": 0.45, "space": -0.20, "structure": 0.10 } }
+    ```
 
-| Priority | Feature | Est. Code Size | Analytical Gain | Implementation Heuristic |
-| :--- | :--- | :---: | :---: | :--- |
-| **5** | **The "Rule of the Square" Visualizer** | ~20 lines | **High** | In endgames with no other active pieces, detect a passed pawn. Let $D$ be the distance (ranks) to promotion. Draw a bounding box of size $D \times D$ from the pawn to the promotion rank. Draw a colored border around this square to show if the defending King can catch it. |
-| **6** | **Escape Squares ("Luft" Alarm)** | ~25 lines | **Medium-High** | Check if the King is castled and the back rank is vulnerable to mate. Check the three squares in front of the King (e.g., f2/g2/h2 for White). If none have advanced, draw a red warning circle on the back rank and a green circle on the ideal pawn-push square. |
-| **7** | **Overloaded Defenders** | ~35 lines | **High** | Find all friendly pieces under attack. For each, grab the set of defending pieces. If the intersection of these defender sets reveals a single piece defending two or more attacked targets, highlight that overloaded defender in yellow with dashed arrows pointing to its duties. |
-| **8** | **Knight Maneuvering Route Guide** | ~40 lines | **Medium** | If an outpost square is identified (from Tier 1) and a friendly knight is on the board, use a simple Breadth-First Search (BFS) of knight jumps to find the shortest path (typically 2-3 moves) to the outpost. Draw numbered, curved green arrows. |
+### Phase 2: Positional Balance Dashboard Widget
+*   **Objective:** Visualize the raw static evaluation data on the frontend.
+*   **Technical Implementation:** 
+    *   Consume the `positional_balance` dictionary from Phase 1.
+    *   Build a clean UI component on the dashboard (such as a split progress bar or a simple horizontal meter) comparing White vs. Black metrics.
+*   **Deliverable:** Live, responsive visual bars showing which side has the positional upper hand in key categories, updating with every move.
+
+### Phase 3: Quiet State Detection (Entropy Calculator)
+*   **Objective:** Programmatically distinguish between dry/maneuvering and sharp/tactical positions.
+*   **Technical Implementation:**
+    *   Configure your primary Stockfish instance to run a Multi-PV search (top 3 to 5 candidate moves).
+    *   Calculate the standard deviation ($\sigma$) of the centipawn evaluations of these top lines.
+    *   Flag the position as `is_quiet_position: true` if $\sigma$ falls below a defined threshold (e.g., $0.15$ centipawns) and no tactical flags from `expert_system.py` are present.
+*   **Deliverable:** A new boolean flag in your API responses indicating whether the board is currently in a quiet state.
+
+### Phase 4: Worst-Placed Piece (WPP) Analyzer
+*   **Objective:** Identify which minor piece has the lowest relative mobility.
+*   **Technical Implementation:**
+    *   Using the `python-chess` library, write a static analyzer that counts the legal moves currently available to each of your Knights, Bishops, and Rooks.
+    *   Normalize this value against each piece's theoretical maximum mobility.
+    *   Identify the piece with the lowest score as the "Worst-Placed Piece" (WPP).
+*   **Deliverable:** A backend helper function that adds a `worst_placed_piece` field (e.g., `"Nb1"`) to the evaluation response.
+
+### Phase 5: Signal Prioritization Pipeline
+*   **Objective:** Prevent visual clutter (arrow overload) on the board in highly complex positions.
+*   **Technical Implementation:**
+    *   Assign a priority level (Critical, High, Medium, Low) to each tactical and positional detector in `expert_system.py`.
+    *   Create an array filter function: if any "Critical" flags (e.g., mate threats, hanging Queen) are present, automatically strip out all "Medium" and "Low" flags (e.g., open files, space advantages) from the payload sent to the frontend.
+*   **Deliverable:** Clean, readable board annotations even in the most chaotic, tactical middlegames.
+
+### Phase 6: Structured LLM Output Migration
+*   **Objective:** Force the LLM to output predictable JSON rather than raw markdown text.
+*   **Technical Implementation:**
+    *   Configure Gemini or Ollama using their native JSON schema / Structured Output parameters [1].
+    *   Define a strict schema ensuring the model outputs a structured explanation:
+        ```json
+        {
+          "thematic_concept": "string",
+          "explanation": "string",
+          "tactical_danger_if_ignored": "string"
+        }
+        ```
+    *   Adjust the frontend to parse this JSON and render the properties into structured UI cards.
+*   **Deliverable:** Complete elimination of conversational LLM filler (e.g., *"Based on the position provided..."*), replacing it with clean, modular UI text.
+
+### Phase 7: LLM Context Capping & Validation
+*   **Objective:** Prevent the LLM from hallucinating chess values or getting overwhelmed by minor details.
+*   **Technical Implementation:**
+    *   Create an "information bottleneck" on the backend that limits the data sent to the LLM prompt to the top 3 prioritized signals from Phase 5.
+    *   Write a post-processing validation function: if the LLM's generated response contains numerical evaluation numbers (e.g., "+1.5") that do not match the actual engine evaluation, strip or correct them using regular expressions before returning the text.
+*   **Deliverable:** Highly accurate, focused, and mathematically sound coaching commentary.
+
+### Phase 8: Interactive "Practice Mistakes" Mode
+*   **Objective:** Give the user a way to actively learn from their errors.
+*   **Technical Implementation:**
+    *   Implement a state machine on the frontend with a simple "Practice Mode" toggle.
+    *   When activated, if a user clicks on any Mistake or Blunder badge, lock the board, clear all engine arrows, and prompt the user to "Find the Best Move."
+    *   Listen to board moves: if the user plays the engine's recommended top move, unlock the coach's explanation and transition back to analysis mode.
+*   **Deliverable:** A simple, gamified retry loop built entirely on top of your existing move classification engine.
+
+### Phase 9: Client-Side Engine Migration (WASM)
+*   **Objective:** Scale your application by shifting computation from the Flask server to the user's browser.
+*   **Technical Implementation:**
+    *   Integrate **Stockfish.js** using Web Workers on the frontend.
+    *   Move the primary evaluation and centipawn calculations to the client side.
+    *   Refactor the Flask backend to act solely as a lightweight API for the LLM coach and the python-chess expert system logic.
+*   **Deliverable:** Highly responsive move analysis with minimal server CPU overhead.

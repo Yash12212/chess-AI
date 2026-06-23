@@ -13,7 +13,15 @@ try:
 except ImportError:
     genai = types = None
 
-from expert_system import prepare_coach_context, clean_meta_text, get_annotations
+from expert_system import (
+    prepare_coach_context,
+    clean_meta_text,
+    get_annotations,
+    PositionalAggregator,
+    get_hanging_pieces,
+    _null_move_threat,
+    WorstPlacedPieceAnalyzer
+)
 
 warnings.filterwarnings("ignore", message=".*null moves.*")
 
@@ -75,6 +83,7 @@ GEMINI_API_KEY = os.environ.get("GEMINI_API_KEY")
 GEMINI_MODEL = os.environ.get("GEMINI_MODEL")
 
 SF_DEPTH, SF_TIME, SF_THREADS, SF_HASH = 20, 0.20, 2, 256
+SF_MULTIPV_DEPTH, SF_MULTIPV_TIME = 14, 0.10
 WIN_PROB_K = 0.00368208
 EP_THRESH = [(0.02, "excellent"), (0.05, "good"), (0.10, "inaccuracy"), (0.20, "mistake")]
 MISS_WIN_MIN, MISS_PLAY_MAX = 0.70, 0.55
@@ -213,25 +222,132 @@ def eval_score(board):
     return v if (v := s.white().score()) is not None else 0
 
 
+def _get_safe_cp_value(pov_score: chess.engine.PovScore) -> float:
+    """Safely extracts raw centipawn float scores or maps mate-in-N to a ceiling of +-3000.0 centipawns."""
+    if pov_score.is_mate():
+        m = pov_score.relative.mate()
+        mate_moves = max(1, abs(m)) if m else 1
+        sign = 1 if m and m > 0 else -1
+        return sign * (3000.0 - (mate_moves * 10))
+    val = pov_score.relative.score()
+    return float(val if val is not None else 0.0)
+
+
+def calculate_stdev(scores):
+    """Computes population standard deviation on raw centipawns."""
+    n = len(scores)
+    if n <= 1:
+        return 0.0
+    mean = sum(scores) / n
+    variance = sum((x - mean) ** 2 for x in scores) / (n - 1)
+    return math.sqrt(variance)
+
+
+def evaluate_and_calculate_pci(board: chess.Board):
+    """Evaluates position and returns (eval_score, pci_score, pci_tier, threat_dict)."""
+    if board.is_game_over():
+        o = board.outcome()
+        winner = o.winner if o is not None else None
+        ev = 0 if winner is None else ("M+0" if winner == chess.WHITE else "M-0")
+        return ev, 0, "Maneuvering", None
+
+    # Retrieve current player color & null move threat
+    opp_color = "Black" if board.turn == chess.WHITE else "White"
+    threat = _null_move_threat(board, opp_color, "threatens", require_minor_pieces=True)
+
+    # 1. Calculate Tactical Density (Max 50%)
+    check_score = 20.0 if board.is_check() else 0.0
+    threat_score = 20.0 if threat is not None else 0.0
+    
+    hanging_w = len(get_hanging_pieces(board, chess.WHITE))
+    hanging_b = len(get_hanging_pieces(board, chess.BLACK))
+    hanging_count = hanging_w + hanging_b
+    hanging_score = min(hanging_count * 10.0, 30.0)
+    
+    tactical_density = min(check_score + threat_score + hanging_score, 50.0)
+
+    # 2. Run Multi-PV=3 search to get scores for Urgency
+    with eng.lock:
+        r = eng.get().analyse(board, chess.engine.Limit(time=SF_MULTIPV_TIME, depth=SF_MULTIPV_DEPTH), multipv=3)
+        r = r if isinstance(r, list) else [r]
+
+    if not r:
+        return 0, 0, "Maneuvering", threat
+
+    # Parse primary evaluation score from the first candidate
+    primary_score = r[0].get("score")
+    if not primary_score:
+        ev = 0
+    elif primary_score.is_mate():
+        m = primary_score.white().mate()
+        ev = 0 if m is None else f"M{'+' if m > 0 else ''}{m}"
+    else:
+        ev = v if (v := primary_score.white().score()) is not None else 0
+
+    # Calculate standard deviation on raw centipawns
+    scores = []
+    has_mate = False
+    for entry in r:
+        score_obj = entry.get("score")
+        if not score_obj:
+            continue
+        if score_obj.is_mate():
+            has_mate = True
+        scores.append(_get_safe_cp_value(score_obj))
+
+    # 3. Calculate Urgency Score (Max 50%)
+    if has_mate:
+        urgency_score = 50.0
+    elif len(scores) < 2:
+        urgency_score = 0.0
+    else:
+        stdev = calculate_stdev(scores)
+        urgency_score = min((stdev / 100.0) * 50.0, 50.0)
+
+    # Combine into PCI
+    pci_score = round(urgency_score + tactical_density)
+    pci_score = max(0, min(100, pci_score))
+
+    # Determine tier
+    if pci_score <= 25:
+        pci_tier = "Maneuvering"
+    elif pci_score <= 50:
+        pci_tier = "Strategic"
+    elif pci_score <= 75:
+        pci_tier = "Sharp"
+    else:
+        pci_tier = "Volatile"
+
+    return ev, pci_score, pci_tier, threat
+
+
 def lpdo_circles(board):
-    """LPDO tracker: red circles on loose pieces (undefended, or attacked by a cheaper piece)
-    of the side to move."""
+    """LPDO tracker: red circles on loose pieces (undefended, or attacked by a cheaper piece,
+    or with attacker count dominance) of the side to move."""
     color, opp = board.turn, not board.turn
     out = []
     for sq in chess.SQUARES:
         piece = board.piece_at(sq)
         if not piece or piece.color != color or piece.piece_type == chess.KING:
             continue
-        attacked = board.is_attacked_by(opp, sq)
-        undefended = attacked and not board.is_attacked_by(color, sq)
-        cheaper = attacked and any(
+        attackers = board.attackers(opp, sq)
+        if not attackers:
+            continue
+        defenders = board.attackers(color, sq)
+        
+        undefended = not defenders
+        cheaper = any(
             PVAL.get(board.piece_at(a).piece_type, 0) < PVAL.get(piece.piece_type, 0)
-            for a in board.attackers(opp, sq) if board.piece_at(a)
+            for a in attackers if board.piece_at(a)
         )
+        attacker_dominance = len(attackers) > len(defenders)
+        
         if undefended:
             out.append({"orig": chess.square_name(sq), "brush": "red", "reason": "Undefended piece under attack"})
         elif cheaper:
             out.append({"orig": chess.square_name(sq), "brush": "red", "reason": "Piece attacked by lower-value piece"})
+        elif attacker_dominance:
+            out.append({"orig": chess.square_name(sq), "brush": "red", "reason": f"Under-defended piece ({len(attackers)} attacker(s) vs {len(defenders)} defender(s))"})
     return out
 
 
@@ -239,9 +355,12 @@ def lpdo_circles(board):
 app = Flask(__name__)
 
 
-def _classify_response(cls, ev, best, acc, arrows, circles, opening=None):
+def _classify_response(cls, ev, best, acc, arrows, circles, pos_bal, opening=None, pci_score=0, pci_tier="Maneuvering", threat=None, positional_details=None, worst_placed_piece=None):
     return jsonify({"classification": cls, "opening_name": opening, "eval": ev,
-                    "best_move": best, "move_accuracy": acc, "arrows": arrows, "circles": circles})
+                    "best_move": best, "move_accuracy": acc, "arrows": arrows, "circles": circles,
+                    "positional_balance": pos_bal, "positional_details": positional_details,
+                    "pci_score": pci_score, "pci_tier": pci_tier, "threat": threat,
+                    "worst_placed_piece": worst_placed_piece})
 
 
 @app.route("/")
@@ -255,7 +374,21 @@ def api_eval():
         return jsonify({"error": "Missing FEN"}), 400
     try:
         board = chess.Board(fen)
-        return jsonify({"eval": eval_score(board), "circles": lpdo_circles(board)})
+        agg = PositionalAggregator(board)
+        pos_bal = agg.get_positional_balance()
+        pos_det = agg.get_positional_details()
+        ev, pci_score, pci_tier, threat = evaluate_and_calculate_pci(board)
+        wpp_data = WorstPlacedPieceAnalyzer(board).get_wpp()
+        return jsonify({
+            "eval": ev,
+            "circles": lpdo_circles(board),
+            "positional_balance": pos_bal,
+            "positional_details": pos_det,
+            "pci_score": pci_score,
+            "pci_tier": pci_tier,
+            "threat": threat,
+            "worst_placed_piece": wpp_data
+        })
     except Exception as e:
         return jsonify({"error": str(e)}), 500
 
@@ -274,7 +407,11 @@ def api_classify():
 
         ba = bb.copy()
         ba.push(mv)
-        ev = eval_score(ba)
+        ev, pci_score, pci_tier, threat = evaluate_and_calculate_pci(ba)
+        agg = PositionalAggregator(ba)
+        pos_bal = agg.get_positional_balance()
+        pos_det = agg.get_positional_details()
+        wpp_data = WorstPlacedPieceAnalyzer(ba).get_wpp()
 
         ann = get_annotations(prev_fen, uci)
         arrows = ann.get("arrows", [])
@@ -282,9 +419,9 @@ def api_classify():
 
         opening = openings_db.get(norm_fen(ba.fen(), 4)) or openings_db.get(norm_fen(ba.fen(), 1))
         if opening:
-            return _classify_response("book", ev, uci, 100.0, arrows, circles, opening)
+            return _classify_response("book", ev, uci, 100.0, arrows, circles, pos_bal, opening, pci_score=pci_score, pci_tier=pci_tier, threat=threat, positional_details=pos_det, worst_placed_piece=wpp_data)
         if bb.legal_moves.count() == 1:
-            return _classify_response("forced", ev, uci, 100.0, arrows, circles)
+            return _classify_response("forced", ev, uci, 100.0, arrows, circles, pos_bal, pci_score=pci_score, pci_tier=pci_tier, threat=threat, positional_details=pos_det, worst_placed_piece=wpp_data)
 
         ab = analyze(bb, multipv=2)
         if not ab:
@@ -315,7 +452,7 @@ def api_classify():
         elif mv == best or xpl <= 0.0001:   cls = "best"
         else:                               cls = next((c for t, c in EP_THRESH if xpl <= t), "blunder")
 
-        return _classify_response(cls, ev, best.uci(), acc, arrows, circles)
+        return _classify_response(cls, ev, best.uci(), acc, arrows, circles, pos_bal, pci_score=pci_score, pci_tier=pci_tier, threat=threat, positional_details=pos_det, worst_placed_piece=wpp_data)
     except Exception as e:
         traceback.print_exc()
         return jsonify({"error": str(e)}), 500
@@ -458,6 +595,7 @@ HTML = r"""
 <head>
   <meta charset="UTF-8">
   <meta name="viewport" content="width=device-width, initial-scale=1.0">
+  <meta name="description" content="Chess Analysis Hub - Analyze your chess games, evaluate positions with Stockfish, track positional balance, and get AI coach insights.">
   <title>Chess Analysis Hub</title>
   <link rel="stylesheet" href="https://cdn.jsdelivr.net/npm/@lichess-org/chessground@10.1.1/assets/chessground.base.css">
   <link rel="stylesheet" href="https://cdn.jsdelivr.net/npm/@lichess-org/chessground@10.1.1/assets/chessground.brown.css">
@@ -485,11 +623,33 @@ HTML = r"""
 <body class="bg-[#0f0f11] bg-[radial-gradient(ellipse_at_center,_var(--tw-gradient-stops))] from-[#18181c] via-[#0f0f11] to-[#0a0a0c] text-neutral-200 min-h-screen flex flex-col items-center p-4 sm:p-6 font-sans select-none antialiased justify-center">
   <div class="w-full max-w-[336px] min-[375px]:max-w-[376px] sm:max-w-[460px] md:max-w-[500px] lg:max-w-[1104px] xl:max-w-[1168px] 2xl:max-w-[1224px] flex flex-col gap-6 mx-auto my-auto">
     <div class="flex flex-col lg:flex-row gap-6 w-full items-stretch justify-center">
-      <div class="flex flex-col gap-4 items-center shrink-0 lg:sticky lg:top-6 lg:self-start">
-        <header class="w-full bg-[#1d1d21]/80 backdrop-blur-md border border-neutral-700/80 p-4 rounded-2xl shadow-md">
-          <div class="flex items-center gap-3">
-            <div class="p-2 rounded-xl bg-emerald-950/40 border border-emerald-500/30 text-emerald-400"><i data-lucide="crown" class="w-5 h-5"></i></div>
-            <h1 class="text-base sm:text-lg font-extrabold text-white tracking-tight">Chess AI</h1>
+      <div class="flex flex-col gap-4 items-center shrink-0 lg:sticky lg:top-6 lg:self-start z-30">
+        <header class="relative z-30 w-full bg-[#1d1d21]/80 backdrop-blur-md border border-neutral-700/80 p-4 rounded-2xl shadow-md">
+          <div class="flex items-center justify-between w-full flex-wrap gap-3">
+            <div class="flex items-center gap-3">
+              <div class="p-2 rounded-xl bg-emerald-950/40 border border-emerald-500/30 text-emerald-400"><i data-lucide="crown" class="w-5 h-5"></i></div>
+              <h1 class="text-base sm:text-lg font-extrabold text-white tracking-tight">Chess AI</h1>
+            </div>
+            <div class="flex items-center gap-2">
+              <div id="turn-indicator" class="px-3 py-1.5 rounded-xl bg-[#2b2d31] border border-neutral-700 text-xs font-black uppercase tracking-wider text-neutral-300">
+                White to move
+              </div>
+              <div class="relative inline-block text-left">
+                <div id="wpp-badge" onclick="toggleWppDropdown()" class="hidden px-3 py-1.5 rounded-xl bg-blue-950/40 border border-blue-500/30 text-blue-400 text-xs font-black uppercase tracking-wider cursor-pointer hover:bg-blue-900/40 transition-all select-none flex items-center gap-1.5 hover:scale-105">
+                  <i data-lucide="crosshair" class="w-3.5 h-3.5"></i>
+                  <span id="wpp-badge-text">Worst Pieces</span>
+                  <i data-lucide="chevron-down" class="w-3.5 h-3.5 ml-0.5"></i>
+                </div>
+                <div id="wpp-dropdown" class="hidden absolute right-0 mt-2 w-72 bg-[#1c1c21]/95 backdrop-blur-md border border-neutral-700/80 rounded-xl shadow-2xl z-50 p-3 flex flex-col gap-2 transition-all">
+                  <div class="text-[10px] font-black uppercase tracking-wider text-neutral-400 border-b border-neutral-800 pb-1.5 mb-1 flex items-center justify-between">
+                    <span>Worst-Placed Pieces</span>
+                    <span class="text-neutral-500 font-normal">Select to show paths</span>
+                  </div>
+                  <div id="wpp-list" class="flex flex-col gap-1.5 max-h-64 overflow-y-auto pr-1">
+                  </div>
+                </div>
+              </div>
+            </div>
           </div>
         </header>
         <div class="flex gap-5 items-stretch justify-center w-full mb-2">
@@ -518,6 +678,64 @@ HTML = r"""
           <div class="flex gap-2 shrink-0 ml-2">
             <button onclick="toggleBoardOrientation()" class="btn btn-em px-2 sm:px-4 group"><i data-lucide="refresh-cw" class="w-5 h-5 transition group-hover:rotate-180 duration-300"></i></button>
             <button onclick="confirmReset()" class="btn btn-red px-2 sm:px-4 group"><i data-lucide="trash-2" class="w-5 h-5 transition group-hover:scale-110 duration-200"></i></button>
+          </div>
+        </div>
+        <!-- Positional Balance Panel -->
+        <div class="w-full p-4 card shadow-md">
+          <h3 class="text-xs font-extrabold uppercase tracking-wider text-neutral-300 mb-2 flex items-center justify-between select-none">
+            <span class="flex items-center gap-2">
+              <i data-lucide="bar-chart-2" class="w-4 h-4 text-emerald-400"></i> Positional Balance
+            </span>
+            <span id="position-complexity-badge" class="hidden px-2 py-0.5 rounded-full text-[10px] font-black uppercase tracking-wider transition-all duration-300"></span>
+          </h3>
+          <div class="space-y-1 select-none">
+            <!-- Metric: Space -->
+            <div id="space-row" onclick="selectMetric('space')" class="flex items-center justify-between gap-3 p-1.5 rounded-xl border border-transparent hover:bg-neutral-800/35 hover:border-neutral-700/30 transition-all cursor-pointer group">
+              <span class="text-neutral-400 text-[10px] sm:text-xs font-bold uppercase tracking-wider flex items-center gap-1 group-hover:text-white transition-colors shrink-0 w-24 sm:w-28">
+                Space <i data-lucide="info" class="w-3 h-3 text-neutral-500 opacity-60"></i>
+              </span>
+              <div class="relative h-1.5 flex-1 bg-[#131316] rounded-full overflow-hidden flex shadow-inner">
+                <div class="w-1/2 flex justify-end bg-transparent border-r border-neutral-800/40">
+                  <div id="space-bar-black" class="h-full bg-[#b33430] transition-all duration-300" style="width: 0%"></div>
+                </div>
+                <div class="w-1/2 bg-transparent">
+                  <div id="space-bar-white" class="h-full bg-[#429443] transition-all duration-300" style="width: 0%"></div>
+                </div>
+              </div>
+              <span id="space-val-text" class="text-neutral-400 font-mono text-xs w-10 text-right shrink-0">0.00</span>
+            </div>
+
+            <!-- Metric: King Safety -->
+            <div id="king_safety-row" onclick="selectMetric('king_safety')" class="flex items-center justify-between gap-3 p-1.5 rounded-xl border border-transparent hover:bg-neutral-800/35 hover:border-neutral-700/30 transition-all cursor-pointer group">
+              <span class="text-neutral-400 text-[10px] sm:text-xs font-bold uppercase tracking-wider flex items-center gap-1 group-hover:text-white transition-colors shrink-0 w-24 sm:w-28">
+                King Safety <i data-lucide="info" class="w-3 h-3 text-neutral-500 opacity-60"></i>
+              </span>
+              <div class="relative h-1.5 flex-1 bg-[#131316] rounded-full overflow-hidden flex shadow-inner">
+                <div class="w-1/2 flex justify-end bg-transparent border-r border-neutral-800/40">
+                  <div id="king-safety-bar-black" class="h-full bg-[#b33430] transition-all duration-300" style="width: 0%"></div>
+                </div>
+                <div class="w-1/2 bg-transparent">
+                  <div id="king-safety-bar-white" class="h-full bg-[#429443] transition-all duration-300" style="width: 0%"></div>
+                </div>
+              </div>
+              <span id="king-safety-val-text" class="text-neutral-400 font-mono text-xs w-10 text-right shrink-0">0.00</span>
+            </div>
+
+            <!-- Metric: Pawn Structure -->
+            <div id="structure-row" onclick="selectMetric('structure')" class="flex items-center justify-between gap-3 p-1.5 rounded-xl border border-transparent hover:bg-neutral-800/35 hover:border-neutral-700/30 transition-all cursor-pointer group">
+              <span class="text-neutral-400 text-[10px] sm:text-xs font-bold uppercase tracking-wider flex items-center gap-1 group-hover:text-white transition-colors shrink-0 w-24 sm:w-28">
+                Structure <i data-lucide="info" class="w-3 h-3 text-neutral-500 opacity-60"></i>
+              </span>
+              <div class="relative h-1.5 flex-1 bg-[#131316] rounded-full overflow-hidden flex shadow-inner">
+                <div class="w-1/2 flex justify-end bg-transparent border-r border-neutral-800/40">
+                  <div id="structure-bar-black" class="h-full bg-[#b33430] transition-all duration-300" style="width: 0%"></div>
+                </div>
+                <div class="w-1/2 bg-transparent">
+                  <div id="structure-bar-white" class="h-full bg-[#429443] transition-all duration-300" style="width: 0%"></div>
+                </div>
+              </div>
+              <span id="structure-val-text" class="text-neutral-400 font-mono text-xs w-10 text-right shrink-0">0.00</span>
+            </div>
           </div>
         </div>
       </div>
@@ -630,13 +848,31 @@ HTML = r"""
       return r;
     };
 
+    let activeWppPaths = new Set();
+    let showWppPath = false;
+
     const newState = (fen, opening, extra={}) => ({
       fen, san:null, color:null, moveNumber:1, classification:null, eval:null,
       opening_name:opening, move_uci:null, best_move:null, move_accuracy:null,
-      insight:null, insightLoading:false, arrows:[], circles:[], ...extra
+      insight:null, insightLoading:false, arrows:[], circles:[], positional_balance:null,
+      positional_details:null, pci_score:null, pci_tier:null, threat:null, worst_placed_piece:null, ...extra
     });
 
-    const reset = () => { states = [newState(START_FEN, "Starting Position")]; currentIndex = 0; };
+    const reset = () => {
+      states = [newState(START_FEN, "Starting Position", {
+        positional_balance: { space: 0.0, king_safety: 0.0, structure: 0.0 },
+        positional_details: { space: [], king_safety: [], structure: [] },
+        pci_score: 0,
+        pci_tier: "Maneuvering",
+        threat: null,
+        worst_placed_piece: null
+      })];
+      currentIndex = 0;
+      showWppPath = false;
+      activeWppPaths.clear();
+      const dropdown = $('wpp-dropdown');
+      if (dropdown) dropdown.classList.add('hidden');
+    };
 
     const clipboard = async text => {
       if (navigator.clipboard) return navigator.clipboard.writeText(text);
@@ -759,15 +995,29 @@ HTML = r"""
       syncInputs(); renderMoveList();
       if ($('opening-name')) $('opening-name').innerText = cur.opening_name || lastOpening(currentIndex) || "Analyzing...";
       
+      const turnInd = $('turn-indicator');
+      if (turnInd) {
+        if (act === 'white') {
+          turnInd.innerText = 'White to move';
+          turnInd.className = 'px-3 py-1.5 rounded-xl bg-neutral-100 border border-neutral-300 text-neutral-900 text-xs font-black uppercase tracking-wider';
+        } else {
+          turnInd.innerText = 'Black to move';
+          turnInd.className = 'px-3 py-1.5 rounded-xl bg-neutral-950 border border-neutral-700 text-neutral-300 text-xs font-black uppercase tracking-wider';
+        }
+      }
+
       const isCalculating = (cur.eval === null && (currentIndex > 0 || cur.evalLoading));
       updateEvalMeter(cur.eval, isCalculating);
       
+      activeWppPaths.clear();
       setBoardClassification(cur.classification); updateMarkings(cur);
       
       displayCoachInsight(cur);
+      updatePositionalBalanceUI(cur.positional_balance, cur.pci_score, cur.pci_tier);
+      updateWppUI(cur.worst_placed_piece);
 
       if (currentIndex > 0 && cur.classification === null) classifyMove(currentIndex);
-      else if (cur.eval === null) evalPosition(currentIndex);
+      else if (cur.eval === null || cur.positional_balance === null) evalPosition(currentIndex);
       else if (currentIndex > 0 && cur.classification && !cur.insight && !cur.insightLoading) {
         fetchCoachInsight(currentIndex);
       }
@@ -781,11 +1031,19 @@ HTML = r"""
         const d = await r.json();
         s.eval = d.eval || "0";
         s.circles = d.circles || [];
+        s.positional_balance = d.positional_balance;
+        s.positional_details = d.positional_details;
+        s.pci_score = d.pci_score;
+        s.pci_tier = d.pci_tier;
+        s.threat = d.threat;
+        s.worst_placed_piece = d.worst_placed_piece;
         if (currentIndex===i) {
           updateEvalMeter(s.eval);
           updateMarkings(s);
+          updatePositionalBalanceUI(s.positional_balance, s.pci_score, s.pci_tier);
+          updateWppUI(s.worst_placed_piece);
         }
-      } catch { if (currentIndex===i) updateEvalMeter(0); }
+      } catch { if (currentIndex===i) { updateEvalMeter(0); updatePositionalBalanceUI(null, null, null); updateWppUI(null); } }
       s.evalLoading = false;
     };
 
@@ -797,13 +1055,21 @@ HTML = r"""
         const d = await r.json();
         Object.assign(s, {classification:d.classification, eval:d.eval, best_move:d.best_move,
           move_accuracy:d.move_accuracy, opening_name:d.opening_name||lastOpening(i),
-          arrows: d.arrows || [], circles: d.circles || []}); // Saved tactical markers here
+          arrows: d.arrows || [], circles: d.circles || [],
+          positional_balance: d.positional_balance,
+          positional_details: d.positional_details,
+          pci_score: d.pci_score,
+          pci_tier: d.pci_tier,
+          threat: d.threat,
+          worst_placed_piece: d.worst_placed_piece}); // Saved WPP here
         if (currentIndex===i) {
           updateEvalMeter(s.eval);
           if ($('opening-name')) $('opening-name').innerText = s.opening_name;
           updateMarkings(s); setBoardClassification(s.classification);
           displayCoachInsight(s);
           fetchCoachInsight(i);
+          updatePositionalBalanceUI(s.positional_balance, s.pci_score, s.pci_tier);
+          updateWppUI(s.worst_placed_piece);
         }
       } catch { Object.assign(s, {classification:'unknown', eval:0, move_accuracy:100}); }
       renderMoveList();
@@ -841,7 +1107,10 @@ HTML = r"""
           classification: s.classification,
           best_move_san: bestMoveSan,
           eval: s.eval,
-          opening_name: s.opening_name
+          opening_name: s.opening_name,
+          threat: s.threat,
+          prev_threat_uci: states[i-1].threat ? states[i-1].threat.threat_move_uci : null,
+          worst_placed_piece: s.worst_placed_piece
         });
 
         const reader = r.body.getReader();
@@ -889,6 +1158,22 @@ HTML = r"""
         }
       }
       lucide.createIcons();
+    };
+
+    let selectedMetric = null;
+    const selectMetric = name => {
+      selectedMetric = selectedMetric === name ? null : name;
+      ['space', 'king_safety', 'structure'].forEach(m => {
+        const row = $(`${m}-row`);
+        if (row) {
+          if (m === selectedMetric) {
+            row.classList.add('bg-neutral-800/40', 'border-neutral-700/50', 'ring-1', 'ring-emerald-500/20');
+          } else {
+            row.classList.remove('bg-neutral-800/40', 'border-neutral-700/50', 'ring-1', 'ring-emerald-500/20');
+          }
+        }
+      });
+      updateMarkings(states[currentIndex]);
     };
 
     const updateMarkings = s => {
@@ -952,6 +1237,48 @@ HTML = r"""
         });
       }
 
+      // Draw selected positional metric highlights
+      if (selectedMetric && s.positional_details && s.positional_details[selectedMetric]) {
+        s.positional_details[selectedMetric].forEach(h => {
+          sh.push({
+            orig: h.orig,
+            dest: h.dest,
+            brush: h.brush,
+            modifiers: h.modifiers || {},
+            reason: h.reason
+          });
+        });
+      }
+
+      // Draw WPP maneuver path arrows for active paths
+      if (s.worst_placed_piece && s.worst_placed_piece.worst_pieces_list) {
+        s.worst_placed_piece.worst_pieces_list.forEach(wpp => {
+          if (activeWppPaths.has(wpp.wpp_square) && wpp.maneuver_path && wpp.maneuver_path.length >= 2) {
+            const path = wpp.maneuver_path;
+            for (let i = 0; i < path.length - 1; i++) {
+              sh.push({
+                orig: path[i],
+                dest: path[i+1],
+                brush: 'blue',
+                modifiers: { lineWidth: 8 },
+                reason: `Maneuver path for worst-placed piece: ${wpp.wpp_name} (${path[i]} -> ${path[i+1]})`
+              });
+            }
+          }
+        });
+      } else if (showWppPath && s.worst_placed_piece && s.worst_placed_piece.maneuver_path && s.worst_placed_piece.maneuver_path.length >= 2) {
+        const path = s.worst_placed_piece.maneuver_path;
+        for (let i = 0; i < path.length - 1; i++) {
+          sh.push({
+            orig: path[i],
+            dest: path[i+1],
+            brush: 'blue',
+            modifiers: { lineWidth: 8 },
+            reason: `Maneuver path for worst-placed piece: ${s.worst_placed_piece.wpp_name} (${path[i]} -> ${path[i+1]})`
+          });
+        }
+      }
+
       window.currentBoardMarkings = sh;
       ground.setShapes(sh);
     };
@@ -999,6 +1326,165 @@ HTML = r"""
       tx.innerText = isMate ? score : fmtEval(score);
       Object.assign(tc.style, {transform: pct >= 50 ? 'translate(-50%,6px)' : 'translate(-50%,calc(-100% - 6px))'});
       tx.style.color = pct >= 50 ? '#0a0a0a' : '#f5f5f5';
+    };
+
+    const updatePositionalBalanceUI = (balance, pciScore, pciTier) => {
+      const badge = $('position-complexity-badge');
+      if (badge) {
+        if (pciScore === null || pciScore === undefined || pciTier === null || pciTier === undefined) {
+          badge.classList.add('hidden');
+        } else {
+          badge.classList.remove('hidden');
+          badge.innerText = `${pciTier} (${pciScore}%)`;
+          if (pciTier === "Maneuvering") {
+            badge.className = 'px-2 py-0.5 rounded-full text-[10px] font-black uppercase tracking-wider bg-neutral-900 border border-neutral-700 text-neutral-400';
+          } else if (pciTier === "Strategic") {
+            badge.className = 'px-2 py-0.5 rounded-full text-[10px] font-black uppercase tracking-wider bg-emerald-950/40 border border-emerald-500/30 text-emerald-400';
+          } else if (pciTier === "Sharp") {
+            badge.className = 'px-2 py-0.5 rounded-full text-[10px] font-black uppercase tracking-wider bg-amber-950/40 border border-amber-500/30 text-amber-400';
+          } else { // Volatile
+            badge.className = 'px-2 py-0.5 rounded-full text-[10px] font-black uppercase tracking-wider bg-red-950/40 border border-red-500/30 text-red-400';
+          }
+        }
+      }
+
+      if (!balance) {
+        ['space', 'king_safety', 'structure'].forEach(metric => {
+          const idName = metric.replace('_', '-');
+          const txt = $(`${idName}-val-text`);
+          if (txt) { txt.innerText = '0.00'; txt.className = 'text-neutral-400 font-mono'; }
+          const wb = $(`${idName}-bar-white`);
+          const bb = $(`${idName}-bar-black`);
+          if (wb) wb.style.width = '0%';
+          if (bb) bb.style.width = '0%';
+        });
+        return;
+      }
+
+      ['space', 'king_safety', 'structure'].forEach(metric => {
+        const val = balance[metric] || 0;
+        const idName = metric.replace('_', '-');
+        const txt = $(`${idName}-val-text`);
+        if (txt) {
+          txt.innerText = val > 0 ? `+${val.toFixed(2)}` : val.toFixed(2);
+          if (val > 0) txt.className = 'text-emerald-400 font-bold font-mono';
+          else if (val < 0) txt.className = 'text-red-400 font-bold font-mono';
+          else txt.className = 'text-neutral-400 font-mono';
+        }
+        const pct = Math.min(Math.abs(val) * 100, 100);
+        const wb = $(`${idName}-bar-white`);
+        const bb = $(`${idName}-bar-black`);
+        if (wb && bb) {
+          if (val >= 0) {
+            wb.style.width = `${pct}%`;
+            bb.style.width = '0%';
+          } else {
+            bb.style.width = `${pct}%`;
+            wb.style.width = '0%';
+          }
+        }
+      });
+    };
+
+    const updateWppUI = wpp => {
+      const badge = $('wpp-badge');
+      const badgeText = $('wpp-badge-text');
+      const listEl = $('wpp-list');
+      if (!badge || !badgeText || !listEl) return;
+      
+      if (wpp && wpp.worst_pieces_list && wpp.worst_pieces_list.length > 0) {
+        badge.classList.remove('hidden');
+        badgeText.innerText = `Worst Pieces (${wpp.worst_pieces_list.length})`;
+        
+        // Populate the dropdown list
+        listEl.innerHTML = wpp.worst_pieces_list.map(item => {
+          const pct = Math.round(item.mobility_ratio * 100);
+          const isActive = activeWppPaths.has(item.wpp_square);
+          const hasPath = item.maneuver_path && item.maneuver_path.length >= 2;
+          
+          return `
+            <div class="p-2 rounded-lg bg-neutral-800/40 border ${isActive ? 'border-blue-500/50 bg-blue-950/20' : 'border-neutral-700/40'} hover:bg-neutral-800/80 transition-all cursor-pointer flex flex-col gap-1" onclick="toggleSingleWppPath('${item.wpp_square}')">
+              <div class="flex items-center justify-between">
+                <div class="flex items-center gap-1.5 font-sans">
+                  <span class="w-2 h-2 rounded-full ${isActive ? 'bg-blue-400 animate-pulse' : 'bg-neutral-600'}"></span>
+                  <span class="text-xs font-bold text-neutral-200">${item.wpp_name}</span>
+                </div>
+                <span class="text-[10px] px-1.5 py-0.5 rounded bg-neutral-900 text-neutral-400 font-semibold">${pct}% active</span>
+              </div>
+              ${hasPath ? `
+                <div class="text-[10px] text-neutral-400 flex items-center gap-1 mt-0.5 font-mono">
+                  <span class="text-blue-400 font-semibold">Path:</span>
+                  <span>${item.maneuver_path.join(' ➔ ')}</span>
+                </div>
+              ` : `
+                <div class="text-[10px] text-neutral-500 italic mt-0.5">No safe improvement path found</div>
+              `}
+            </div>
+          `;
+        }).join('');
+      } else if (wpp && wpp.wpp_name) {
+        // Fallback for single wpp format
+        badge.classList.remove('hidden');
+        badgeText.innerText = `Worst Piece: ${wpp.wpp_name}`;
+        
+        const pct = Math.round(wpp.mobility_ratio * 100);
+        const isActive = showWppPath;
+        const hasPath = wpp.maneuver_path && wpp.maneuver_path.length >= 2;
+        
+        listEl.innerHTML = `
+          <div class="p-2 rounded-lg bg-neutral-800/40 border ${isActive ? 'border-blue-500/50 bg-blue-950/20' : 'border-neutral-700/40'} hover:bg-neutral-800/80 transition-all cursor-pointer flex flex-col gap-1" onclick="toggleWppPath()">
+            <div class="flex items-center justify-between">
+              <div class="flex items-center gap-1.5 font-sans">
+                <span class="w-2 h-2 rounded-full ${isActive ? 'bg-blue-400 animate-pulse' : 'bg-neutral-600'}"></span>
+                <span class="text-xs font-bold text-neutral-200">${wpp.wpp_name}</span>
+              </div>
+              <span class="text-[10px] px-1.5 py-0.5 rounded bg-neutral-900 text-neutral-400 font-semibold">${pct}% active</span>
+            </div>
+            ${hasPath ? `
+              <div class="text-[10px] text-neutral-400 flex items-center gap-1 mt-0.5 font-mono">
+                <span class="text-blue-400 font-semibold">Path:</span>
+                <span>${wpp.maneuver_path.join(' ➔ ')}</span>
+              </div>
+            ` : `
+              <div class="text-[10px] text-neutral-500 italic mt-0.5">No safe improvement path found</div>
+            `}
+          </div>
+        `;
+      } else {
+        badge.classList.add('hidden');
+        const dropdown = $('wpp-dropdown');
+        if (dropdown) dropdown.classList.add('hidden');
+      }
+    };
+
+    const toggleWppPath = () => {
+      showWppPath = !showWppPath;
+      if (states[currentIndex] && states[currentIndex].worst_placed_piece) {
+        updateWppUI(states[currentIndex].worst_placed_piece);
+      }
+      updateMarkings(states[currentIndex]);
+    };
+
+    const toggleWppDropdown = () => {
+      const dropdown = $('wpp-dropdown');
+      if (dropdown) {
+        dropdown.classList.toggle('hidden');
+        if (!dropdown.classList.contains('hidden') && states[currentIndex]) {
+          updateWppUI(states[currentIndex].worst_placed_piece);
+        }
+      }
+    };
+
+    const toggleSingleWppPath = sq => {
+      if (activeWppPaths.has(sq)) {
+        activeWppPaths.delete(sq);
+      } else {
+        activeWppPaths.add(sq);
+      }
+      if (states[currentIndex]) {
+        updateWppUI(states[currentIndex].worst_placed_piece);
+        updateMarkings(states[currentIndex]);
+      }
     };
 
     const navigate = d => {
@@ -1170,7 +1656,7 @@ HTML = r"""
     $('tab-bar').innerHTML = TABS.map(t => `<button class="${tabClass(t.active)}" data-tab="${t.id}" onclick="switchTab('${t.id}')">${t.label}</button>`).join('');
     $('kbd-help').innerHTML = SHORTCUTS.map(([k,v]) => `<div class="flex justify-between items-center border-b border-neutral-800/20 pb-1.5"><span class="kbd">${k}</span><span class="text-[10px]">${v}</span></div>`).join('');
 
-    Object.assign(window, {navigate, toggleBoardOrientation, confirmReset, switchTab, loadCustomFen, copyCurrentFen, copyCurrentPgn, importPgn});
+    Object.assign(window, {navigate, toggleBoardOrientation, confirmReset, switchTab, loadCustomFen, copyCurrentFen, copyCurrentPgn, importPgn, selectMetric, toggleWppPath, toggleWppDropdown, toggleSingleWppPath});
 
     const keyActions = {
       arrowleft:()=>navigate('back'), pageup:()=>navigate('back'), backspace:()=>navigate('back'),
@@ -1186,6 +1672,16 @@ HTML = r"""
     });
     $('fen-input').addEventListener('keydown', e => e.key==='Enter' && loadCustomFen());
     window.addEventListener('resize', () => { ground && ground.redrawAll(); updateMarkings(states[currentIndex]); });
+
+    window.addEventListener('click', e => {
+      const dropdown = $('wpp-dropdown');
+      const badge = $('wpp-badge');
+      if (dropdown && !dropdown.classList.contains('hidden')) {
+        if (!dropdown.contains(e.target) && !badge.contains(e.target) && !badge.querySelector('*')?.contains(e.target)) {
+          dropdown.classList.add('hidden');
+        }
+      }
+    });
 
     const getSquareCenter = (square, rect, o) => {
       const col = square.charCodeAt(0) - 97;
