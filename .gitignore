@@ -32,6 +32,7 @@ coverage.xml
 *,cover
 .hypothesis/
 htmlcov/
+test_output/
 
 # 🔑 Environment & Secrets
 .env

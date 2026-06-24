@@ -1,6 +1,7 @@
 # app.py
 import os, re, json, math, shutil, sys, threading, traceback, logging, warnings
 from pathlib import Path
+from typing import Any
 
 from flask import Flask, request, jsonify, render_template_string, Response
 import chess
@@ -17,10 +18,12 @@ from expert_system import (
     prepare_coach_context,
     clean_meta_text,
     get_annotations,
+    prioritize_annotations,
     PositionalAggregator,
     get_hanging_pieces,
     _null_move_threat,
-    WorstPlacedPieceAnalyzer
+    WorstPlacedPieceAnalyzer,
+    strip_empty
 )
 
 warnings.filterwarnings("ignore", message=".*null moves.*")
@@ -361,10 +364,10 @@ def lpdo_circles(board):
 app = Flask(__name__)
 
 
-def _classify_response(cls, ev, best, acc, arrows, circles, pos_bal, opening=None, pci_score=0, pci_tier="Maneuvering", threat=None, positional_details=None, worst_placed_piece=None):
-    return jsonify({"classification": cls, "opening_name": opening, "eval": ev,
-                    "best_move": best, "move_accuracy": acc, "arrows": arrows, "circles": circles,
-                    "positional_balance": pos_bal, "positional_details": positional_details,
+def _classify_response(classification, eval, best_move, move_accuracy, arrows, circles, positional_balance, opening_name=None, pci_score=0, pci_tier="Maneuvering", threat=None, positional_details=None, worst_placed_piece=None):
+    return jsonify({"classification": classification, "opening_name": opening_name, "eval": eval,
+                    "best_move": best_move, "move_accuracy": move_accuracy, "arrows": arrows, "circles": circles,
+                    "positional_balance": positional_balance, "positional_details": positional_details,
                     "pci_score": pci_score, "pci_tier": pci_tier, "threat": threat,
                     "worst_placed_piece": worst_placed_piece})
 
@@ -399,45 +402,42 @@ def api_eval():
         return jsonify({"error": str(e)}), 500
 
 
-@app.route("/api/classify", methods=["POST"])
-def api_classify():
-    d = request.json
-    prev_fen, uci = d.get("prev_fen"), d.get("move_uci")
-    if not prev_fen or not uci:
-        return jsonify({"error": "Missing parameters"}), 400
-    try:
-        bb = chess.Board(prev_fen)
-        mv = chess.Move.from_uci(uci)
-        if mv not in bb.legal_moves:
-            return jsonify({"error": "Illegal move"}), 400
+def classify_move(prev_fen: str, uci: str):
+    """Pure (non-Flask) move classification. Returns a dict mirroring /api/classify JSON,
+    or raises ValueError for illegal input. Used by both the API route and terminal tests."""
+    bb = chess.Board(prev_fen)
+    mv = chess.Move.from_uci(uci)
+    if mv not in bb.legal_moves:
+        raise ValueError("Illegal move")
 
-        ba = bb.copy()
-        ba.push(mv)
-        ev, pci_score, pci_tier, threat = evaluate_and_calculate_pci(ba)
-        agg = PositionalAggregator(ba)
-        pos_bal = agg.get_positional_balance()
-        pos_det = agg.get_positional_details()
-        wpp_data = WorstPlacedPieceAnalyzer(ba).get_wpp()
+    ba = bb.copy()
+    ba.push(mv)
+    ev, pci_score, pci_tier, threat = evaluate_and_calculate_pci(ba)
+    agg = PositionalAggregator(ba)
+    pos_bal = agg.get_positional_balance()
+    pos_det = agg.get_positional_details()
+    wpp_data = WorstPlacedPieceAnalyzer(ba).get_wpp()
 
-        ann = get_annotations(prev_fen, uci)
-        arrows = ann.get("arrows", [])
-        circles = ann.get("circles", []) + lpdo_circles(ba)
+    ann = get_annotations(prev_fen, uci)
+    raw_arrows = ann.get("arrows", [])
+    raw_circles = ann.get("circles", []) + lpdo_circles(ba)
+    arrows, circles = prioritize_annotations(raw_arrows, raw_circles)
 
-        opening = openings_db.get(norm_fen(ba.fen(), 4)) or openings_db.get(norm_fen(ba.fen(), 1))
-        if opening:
-            return _classify_response("book", ev, uci, 100.0, arrows, circles, pos_bal, opening, pci_score=pci_score, pci_tier=pci_tier, threat=threat, positional_details=pos_det, worst_placed_piece=wpp_data)
-        if bb.legal_moves.count() == 1:
-            return _classify_response("forced", ev, uci, 100.0, arrows, circles, pos_bal, pci_score=pci_score, pci_tier=pci_tier, threat=threat, positional_details=pos_det, worst_placed_piece=wpp_data)
-
+    opening = openings_db.get(norm_fen(ba.fen(), 4)) or openings_db.get(norm_fen(ba.fen(), 1))
+    if opening:
+        cls, best, acc = "book", uci, 100.0
+    elif bb.legal_moves.count() == 1:
+        cls, best, acc = "forced", uci, 100.0
+    else:
         ab = analyze(bb, multipv=2)
         if not ab:
-            return jsonify({"error": "Engine failed"}), 500
-        best = ab[0]["move"]
-        if not isinstance(best, chess.Move):
-            return jsonify({"error": "Engine failed to return valid move"}), 500
+            raise RuntimeError("Engine failed")
+        best_move = ab[0]["move"]
+        if not isinstance(best_move, chess.Move):
+            raise RuntimeError("Engine failed to return valid move")
         sb = ab[0]["score"]
         if not isinstance(sb, int):
-            return jsonify({"error": "Engine failed to return valid score"}), 500
+            raise RuntimeError("Engine failed to return valid score")
 
         turn = bb.turn
         nps = parse_eval(ev)
@@ -446,19 +446,36 @@ def api_classify():
         wp_a = win_prob(sa)
         xpl = max(0.0, wp_b - wp_a)
 
-        acc = 100.0 if mv == best else max(0.0, min(100.0, 103.1668 * math.exp(-0.04354 * xpl * 100) - 3.1669))
+        acc = 100.0 if mv == best_move else max(0.0, min(100.0, 103.1668 * math.exp(-0.04354 * xpl * 100) - 3.1669))
         sb1 = ab[1]["score"] if len(ab) > 1 and isinstance(ab[1]["score"], int) else 0
-        great = mv == best and len(ab) > 1 and ((sb - sb1) if turn == chess.WHITE else (sb1 - sb)) >= 150
-        brilliant = _is_brilliant(bb, ba, mv, best, turn, sa)
-        miss = mv != best and wp_b >= MISS_WIN_MIN and wp_a < MISS_PLAY_MAX
+        great = mv == best_move and len(ab) > 1 and ((sb - sb1) if turn == chess.WHITE else (sb1 - sb)) >= 150
+        brilliant = _is_brilliant(bb, ba, mv, best_move, turn, sa)
+        miss = mv != best_move and wp_b >= MISS_WIN_MIN and wp_a < MISS_PLAY_MAX
 
-        if brilliant:                       cls = "brilliant"
-        elif great:                         cls = "great"
-        elif miss:                          cls = "miss"
-        elif mv == best or xpl <= 0.0001:   cls = "best"
-        else:                               cls = next((c for t, c in EP_THRESH if xpl <= t), "blunder")
+        if brilliant:                     cls = "brilliant"
+        elif great:                       cls = "great"
+        elif miss:                        cls = "miss"
+        elif mv == best_move or xpl <= 0.0001: cls = "best"
+        else:                             cls = next((c for t, c in EP_THRESH if xpl <= t), "blunder")
+        best = best_move.uci()
 
-        return _classify_response(cls, ev, best.uci(), acc, arrows, circles, pos_bal, pci_score=pci_score, pci_tier=pci_tier, threat=threat, positional_details=pos_det, worst_placed_piece=wpp_data)
+    return {"classification": cls, "opening_name": opening, "eval": ev,
+            "best_move": best, "move_accuracy": acc, "arrows": arrows, "circles": circles,
+            "positional_balance": pos_bal, "positional_details": pos_det,
+            "pci_score": pci_score, "pci_tier": pci_tier, "threat": threat,
+            "worst_placed_piece": wpp_data}
+
+
+@app.route("/api/classify", methods=["POST"])
+def api_classify():
+    d = request.json
+    prev_fen, uci = d.get("prev_fen"), d.get("move_uci")
+    if not prev_fen or not uci:
+        return jsonify({"error": "Missing parameters"}), 400
+    try:
+        return _classify_response(**classify_move(prev_fen, uci))
+    except ValueError:
+        return jsonify({"error": "Illegal move"}), 400
     except Exception as e:
         traceback.print_exc()
         return jsonify({"error": str(e)}), 500
@@ -483,45 +500,167 @@ def _is_brilliant(bb, ba, mv, best, turn, sa):
 
 
 # ── Coach (LLM) ───────────────────────────────────────────────────────
-SYS_INTRO = "You are an objective chess analyst. Output exactly two sentences."
+SYS_INTRO = "You are an objective chess analyst."
 SYS_OUTRO = "Output only the commentary."
+
+
+def validate_llm_json(text: str, actual_eval: str) -> str:
+    """Post-processing validation (Phase 7): parses the LLM JSON response, 
+    verifies that any chess evaluations mentioned in the explanation match the actual engine eval,
+    and returns the corrected JSON string."""
+    try:
+        clean_text = text.strip()
+        # Handle markdown code blocks
+        if clean_text.startswith("```"):
+            lines = clean_text.splitlines()
+            if lines[0].startswith("```"):
+                lines = lines[1:]
+            if lines and lines[-1].startswith("```"):
+                lines = lines[:-1]
+            clean_text = "\n".join(lines).strip()
+            
+        data = json.loads(clean_text)
+        
+        # Verify required keys exist
+        for key in ["thematic_concept", "explanation", "tactical_danger_if_ignored"]:
+            if key not in data:
+                data[key] = ""
+                
+        if not actual_eval:
+            return json.dumps(data)
+            
+        explanation = data.get("explanation", "")
+        # Find any patterns like "+1.5", "-0.34", etc. and replace if they don't match actual_eval
+        evals_found = re.findall(r'[+-]\d+\.\d+', explanation)
+        for val in evals_found:
+            if val != actual_eval:
+                explanation = explanation.replace(val, actual_eval)
+        
+        # Also clean up M+ or M- forced mate values if they don't match
+        if "M" in actual_eval:
+            m_found = re.findall(r'M\d+|forced mate-in-\d+|mate-in-\d+|checkmate in \d+', explanation)
+            for val in m_found:
+                if actual_eval not in val:
+                    explanation = explanation.replace(val, f"forced mate ({actual_eval})")
+                    
+        data["explanation"] = explanation
+        return json.dumps(data)
+    except Exception as e:
+        logger.warning("Failed to validate LLM response JSON: %s. Returning wrapped text.", e)
+        try:
+            return json.dumps({
+                "thematic_concept": "Chess Analysis",
+                "explanation": text,
+                "tactical_danger_if_ignored": "None"
+            })
+        except Exception:
+            return text
 
 
 def build_coach_prompts(ctx):
     p, m = ctx["player_color"], ctx["move_san"]
     cls, ev, ev_desc = ctx["cls_label"], ctx["eval_str"], ctx["eval_desc"]
     purpose, ref, best = ctx["move_purpose"], ctx["refutation_pv"], ctx["best_move_san"]
-    feats = ctx["features_block"]
+    
+    # Retrieve raw features dict (or parse features_block if not present)
+    features = ctx.get("features")
+    if not features:
+        features = json.loads(ctx["features_block"])
 
     def ev_phrase():
         raw = ev.replace("+", "").replace("-", "").strip()
         return "" if (raw and raw in ev_desc) else f" with an evaluation of {ev}"
 
-    sys_first = sys_second = ""
-    if ctx.get("is_checkmate"):
-        sys_first = "State that checkmate has been delivered."
-        sys_second = "Confirm that this concludes the game."
-        instr = f"1. State that {p} delivered checkmate with {m}.\n2. Confirm that this concludes the game."
-    elif ctx.get("is_forced_mate") and not ctx["is_bad_move"]:
-        sys_first = "Explain the forced checkmate sequence setup."
-        sys_second = "Note the forced checkmate valuation."
-        instr = f"1. State that {p} played {m} to set up a forced mate.\n2. Note that the evaluation is a forced checkmate ({ev})."
-    elif ctx["is_bad_move"]:
-        sys_first = "Explain why the move is bad using the provided evaluation."
-        sys_second = "State the refutation sequence exactly as provided."
-        phrase = {"inaccuracy": "an inaccuracy", "mistake": "a mistake"}.get(cls, "a blunder")
-        lead = f"1. Explain that {p} played {m}, which is {phrase} because it {ev_desc}{ev_phrase()}.\n"
-        instr = lead + (f"2. Conclude by writing: The refutation is exactly: {ref}." if ref else f"2. State that '{best}' was the best alternative.")
+    # Bottleneck data (Phase 7: LLM Context Capping) to top 3 prioritized signals:
+    # 1. Move and its purpose
+    # 2. Refutation details (for bad moves) or WPP (for positional moves)
+    # 3. Active tactical threats
+    pruned: dict[str, Any] = {
+        "move": {
+            "san": m,
+            "classification": cls,
+            "purpose": purpose
+        }
+    }
+    
+    # Add threat if any (highly prioritized)
+    threat = ctx.get("threat")
+    if threat:
+        pruned["threat"] = threat
+    
+    # Add refutation if bad move
+    is_bad_move = ctx.get("is_bad_move")
+    if is_bad_move:
+        pruned["move"]["is_bad_move"] = True
+        pruned["move"]["eval"] = ev
+        if ref:
+            pruned["refutation_pv"] = ref
     else:
-        sys_first = "Explain the move's purpose."
-        sys_second = "State the evaluation or immediate tactical benefit."
-        if ctx["benefit_detail"]:
-            instr = f"1. Explain that {p} played {m} to {purpose}.\n2. Describe the benefit of {m} using the Fork or Rook details from the provided JSON."
-        else:
-            instr = f"1. Explain that {p} played {m} to {purpose}.\n2. State that this move {ev_desc}{ev_phrase()}."
+        # Add WPP if positional
+        wpp_name = ctx.get("worst_placed_piece")
+        wpp_reason = ctx.get("wpp_reason")
+        if wpp_name and "Queen" not in wpp_name:
+            pruned["worst_placed_piece"] = {
+                "name": wpp_name,
+                "reason": wpp_reason
+            }
+            
+        # Add fork/rook file benefits if applicable
+        if ctx.get("benefit_detail"):
+            benefits = []
+            fork_made = features.get("tactics", {}).get("fork")
+            if fork_made:
+                benefits.append(f"creating a fork ({fork_made})")
+            rook_files = features.get("strategy", {}).get("rook_files")
+            if rook_files:
+                benefits.append(f"activating a rook on open/semi-open file ({', '.join(rook_files)})")
+            if benefits:
+                pruned["move_benefit"] = " and ".join(benefits)
 
-    system_prompt = f"{SYS_INTRO} First sentence: {sys_first} Second sentence: {sys_second} {SYS_OUTRO}"
-    user_prompt = f"Data:\n{feats}\n{ctx['eval_context']}\n\nInstructions:\n{instr}\n\nRule: Write exactly two sentences. Never repeat the evaluation or its description. No meta-text."
+    # Determine concept theme and instructions
+    wpp_desc = ""
+    wpp_name = ctx.get("worst_placed_piece")
+    wpp_reason = ctx.get("wpp_reason")
+    if wpp_name and "Queen" not in wpp_name:
+        wpp_desc = f" Mention that the worst placed piece is the {wpp_name} ({wpp_reason}) to explain the broader positional strategy."
+
+    if ctx.get("is_checkmate"):
+        concept = "Checkmate"
+        exp_instruction = f"State that {p} delivered checkmate with {m}, concluding the game."
+    elif ctx.get("is_forced_mate") and not is_bad_move:
+        concept = "Forced Mate"
+        exp_instruction = f"State that {p} played {m} to set up a forced mate, noting that the evaluation is a forced checkmate ({ev})."
+    elif is_bad_move:
+        phrase = {"inaccuracy": "an inaccuracy", "mistake": "a mistake"}.get(cls, "a blunder")
+        concept = phrase.capitalize()
+        exp_instruction = f"Explain that {p} played {m}, which is {phrase} because it {ev_desc}{ev_phrase()}."
+        if ref:
+            exp_instruction += f" Conclude by stating: The refutation is exactly: {ref}."
+        else:
+            exp_instruction += f" Conclude by stating that '{best}' was the best alternative."
+    else:
+        concept = "Positional improvement"
+        if ctx.get("benefit_detail") and "move_benefit" in pruned:
+            exp_instruction = f"State the purpose of {p} playing {m}: {purpose}. Describe the benefit of {m} using: {pruned['move_benefit']}."
+        else:
+            exp_instruction = f"State the purpose of {p} playing {m}: {purpose}. State that this move {ev_desc}{ev_phrase()}.{wpp_desc}"
+
+    system_prompt = """You are a chess coaching assistant. You must analyze the provided position data and return a JSON object with the following fields:
+{
+  "thematic_concept": "A short description of the core chess theme (e.g., 'Controlling the center', 'King safety', 'Tactical error')",
+  "explanation": "A concise explanation of the move, its purpose, and evaluation as instructed",
+  "tactical_danger_if_ignored": "A brief warning about any opponent threats or tactical dangers in the position. If there are no threats, write 'None'."
+}
+Output ONLY the JSON object. Do not include markdown backticks or any conversation filler."""
+
+    user_prompt = f"""Data:
+{json.dumps(pruned, indent=2)}
+
+Instructions:
+1. "thematic_concept": Classify this position/move into a theme like '{concept}'.
+2. "explanation": {exp_instruction}
+3. "tactical_danger_if_ignored": {f"Describe the threat in the data: {threat}" if threat else "Confirm there are no tactical threats (write 'None')"}"""
+
     return system_prompt, user_prompt
 
 
@@ -539,35 +678,83 @@ def _stream(iterable, log_title):
         yield f"\n[Coach Error: {e}]"
 
 
-def stream_google(system_prompt, prompt):
+def stream_google(system_prompt, prompt, actual_eval):
     if not GEMINI_API_KEY or not GEMINI_MODEL:
         yield "[Coach Error: Gemini API Key or Model is not configured.]"; return
     if genai is None or types is None:
         yield "[Coach Error: google-genai library not installed.]"; return
-    client = genai.Client(api_key=GEMINI_API_KEY)
-    resp = client.models.generate_content_stream(
-        model=GEMINI_MODEL, contents=prompt,
-        config=types.GenerateContentConfig(system_instruction=system_prompt,
-                                           temperature=0.1, max_output_tokens=150))
-    yield from _stream((chunk.text for chunk in resp if chunk.text), "GOOGLE AI STUDIO OUTPUT")
-
-
-def stream_ollama(system_prompt, prompt):
-    client = ollama.Client(host=OLLAMA_HOST)
-    kwargs = dict(model=OLLAMA_MODEL or "",
-                  messages=[{"role": "system", "content": system_prompt},
-                            {"role": "user", "content": prompt}],
-                  options={"temperature": 0.1, "num_predict": 150})
+    
     try:
-        stream = client.chat(think=False, stream=True, **kwargs)
-    except TypeError:                       # older ollama has no `think` kwarg
-        stream = client.chat(stream=True, **kwargs)
+        client = genai.Client(api_key=GEMINI_API_KEY)
+        config = types.GenerateContentConfig(
+            system_instruction=system_prompt,
+            temperature=0.1,
+            max_output_tokens=250,
+            response_mime_type="application/json",
+            response_schema={
+                "type": "OBJECT",
+                "properties": {
+                    "thematic_concept": {"type": "STRING"},
+                    "explanation": {"type": "STRING"},
+                    "tactical_danger_if_ignored": {"type": "STRING"}
+                },
+                "required": ["thematic_concept", "explanation", "tactical_danger_if_ignored"]
+            }
+        )
+        resp = client.models.generate_content(
+            model=GEMINI_MODEL, contents=prompt, config=config
+        )
+        text = resp.text or ""
+        validated_text = validate_llm_json(text, actual_eval)
+        
+        logger.info(log_box("GOOGLE AI STUDIO OUTPUT", validated_text, "32"))
+        
+        chunk_size = 12
+        for i in range(0, len(validated_text), chunk_size):
+            yield validated_text[i:i+chunk_size]
+            import time
+            time.sleep(0.01)
+    except Exception as e:
+        logger.error("Generator failed: %s", e)
+        yield f"\n[Coach Error: {e}]"
 
-    def chunks():
-        for chunk in stream:
-            msg = getattr(chunk, 'message', None) or chunk.get('message', {})
-            yield getattr(msg, 'content', None) or msg.get('content', '')
-    yield from _stream(chunks(), "LLM OUTPUT")
+
+def stream_ollama(system_prompt, prompt, actual_eval):
+    try:
+        client = ollama.Client(host=OLLAMA_HOST)
+        try:
+            resp = client.chat(
+                model=OLLAMA_MODEL or "",
+                messages=[{"role": "system", "content": system_prompt},
+                          {"role": "user", "content": prompt}],
+                format="json",
+                options={"temperature": 0.1, "num_predict": 250},
+                think=False
+            )
+        except TypeError:
+            resp = client.chat(
+                model=OLLAMA_MODEL or "",
+                messages=[{"role": "system", "content": system_prompt},
+                          {"role": "user", "content": prompt}],
+                format="json",
+                options={"temperature": 0.1, "num_predict": 250}
+            )
+
+        msg = getattr(resp, 'message', None) or resp.get('message', {})
+        text = getattr(msg, 'content', None) or msg.get('content', '')
+        
+        validated_text = validate_llm_json(text, actual_eval)
+        
+        logger.info(log_box("LLM OUTPUT", validated_text, "32"))
+        
+        chunk_size = 12
+        for i in range(0, len(validated_text), chunk_size):
+            yield validated_text[i:i+chunk_size]
+            import time
+            time.sleep(0.01)
+    except Exception as e:
+        logger.error("Generator failed: %s", e)
+        yield f"\n[Coach Error: {e}]"
 
 
 @app.route("/api/coach", methods=["POST"])
@@ -582,7 +769,8 @@ def api_coach():
     logger.debug(log_box(f"SYSTEM PROMPT SENT TO {LLM_PROVIDER.upper()}", system_prompt, "36"))
     logger.debug(log_box(f"USER PROMPT SENT TO {LLM_PROVIDER.upper()}", prompt, "33"))
 
-    gen = stream_google(system_prompt, prompt) if LLM_PROVIDER == "google" else stream_ollama(system_prompt, prompt)
+    actual_eval = ctx.get("eval_str") or ""
+    gen = stream_google(system_prompt, prompt, actual_eval) if LLM_PROVIDER == "google" else stream_ollama(system_prompt, prompt, actual_eval)
     return Response(gen, mimetype="text/plain")
 
 
@@ -855,11 +1043,8 @@ HTML = r"""
         <div class="w-full px-3.5 py-2.5 card shadow-md flex flex-col gap-2" id="wpp-card">
           <h3 class="text-[11px] font-black uppercase tracking-wider text-neutral-300 flex flex-wrap items-center justify-between gap-1 select-none">
             <span class="flex items-center gap-1.5">
-              <i data-lucide="crosshair" class="w-3.5 h-3.5 text-blue-400"></i> Worst Pieces
+              <i data-lucide="crosshair" class="w-3.5 h-3.5 text-blue-400"></i> Worst Piece
             </span>
-            <button id="toggle-all-maneuvers-btn" onclick="toggleAllManeuvers()" class="px-2 py-0.5 rounded-md bg-[#202226] border border-neutral-800/80 text-[9px] font-bold uppercase tracking-wider text-neutral-300 hover:bg-[#282a2f] hover:text-white transition-all flex items-center gap-1 shrink-0" title="Show maneuvering ideas">
-              <i data-lucide="eye" class="w-3 h-3 text-blue-400"></i> Maneuvers
-            </button>
           </h3>
           <div id="wpp-list" class="flex flex-col gap-1.5 h-[110px] overflow-y-auto pr-1">
             <div class="flex flex-col items-center justify-center h-full text-neutral-500 text-xs font-sans animate-pulse"><i data-lucide="loader-2" class="w-4 h-4 text-neutral-500 animate-spin mb-1"></i><span>Analyzing position...</span></div>
@@ -902,7 +1087,6 @@ HTML = r"""
       ["F","Flip"],["R","Reset"],["M","Moves"],["S","Stats"],["I","Import/Export"],["C","Copy FEN"],["P","Copy PGN"]];
 
     let states, currentIndex, chess, ground;
-    let showAllManeuvers = false;
     let analysisExpanded = true;
     let activeTab = 'game';
     const $ = id => document.getElementById(id);
@@ -1047,9 +1231,6 @@ HTML = r"""
       return r;
     };
 
-    let activeWppPaths = new Set();
-    let showWppPath = false;
-
     const newState = (fen, opening, extra={}) => ({
       fen, san:null, color:null, moveNumber:1, classification:null, eval:null,
       opening_name:opening, move_uci:null, best_move:null, move_accuracy:null,
@@ -1067,16 +1248,6 @@ HTML = r"""
         worst_placed_piece: null
       })];
       currentIndex = 0;
-      showWppPath = false;
-      showAllManeuvers = false;
-      activeWppPaths.clear();
-      const btn = $('toggle-all-maneuvers-btn');
-      if (btn) {
-        btn.className = 'px-2 py-0.5 rounded-md bg-[#202226] border border-neutral-800/80 text-[9px] font-bold uppercase tracking-wider text-neutral-300 hover:bg-[#282a2f] hover:text-white transition-all flex items-center gap-1 shrink-0';
-        btn.innerHTML = `<i data-lucide="eye" class="w-3 h-3 text-blue-400"></i> Maneuvers`;
-      }
-      const dropdown = $('wpp-dropdown');
-      if (dropdown) dropdown.classList.add('hidden');
     };
 
     const clipboard = async text => {
@@ -1222,7 +1393,6 @@ HTML = r"""
       const isCalculating = (cur.eval === null && (currentIndex > 0 || cur.evalLoading));
       updateEvalMeter(cur.eval, isCalculating);
       
-      activeWppPaths.clear();
       setBoardClassification(cur.classification); updateMarkings(cur);
       
       displayCoachInsight(cur);
@@ -1335,7 +1505,7 @@ HTML = r"""
           if (done) break;
           s.insight += decoder.decode(value, { stream: true });
           if (currentIndex === i) {
-            $('coach-content').innerHTML = `<div class="prose prose-invert text-lg leading-relaxed font-sans">${s.insight}</div>`;
+            $('coach-content').innerHTML = renderCoachJSON(s.insight);
           }
         }
       } catch {
@@ -1347,6 +1517,51 @@ HTML = r"""
           displayCoachInsight(s);
         }
       }
+    };
+
+    const renderCoachJSON = jsonStr => {
+      if (!jsonStr) return "";
+      
+      // If it doesn't look like JSON (e.g. error message, plain text), return as-is
+      if (!jsonStr.trim().startsWith("{") && !jsonStr.includes("thematic_concept")) {
+        return `<div class="prose prose-invert text-xs leading-relaxed font-sans text-neutral-300 select-text">${jsonStr}</div>`;
+      }
+      
+      let concept = "", explanation = "", danger = "";
+      try {
+        const cleanStr = jsonStr.trim();
+        const data = JSON.parse(cleanStr);
+        concept = data.thematic_concept || "";
+        explanation = data.explanation || "";
+        danger = data.tactical_danger_if_ignored || "";
+      } catch (e) {
+        // Fallback to robust partial regex parsing during streaming
+        const conceptMatch = jsonStr.match(/"thematic_concept"\s*:\s*"([^"\\]*(?:\\.[^"\\]*)*)"?/);
+        const explanationMatch = jsonStr.match(/"explanation"\s*:\s*"([^"\\]*(?:\\.[^"\\]*)*)"?/);
+        const dangerMatch = jsonStr.match(/"tactical_danger_if_ignored"\s*:\s*"([^"\\]*(?:\\.[^"\\]*)*)"?/);
+        
+        if (conceptMatch) concept = conceptMatch[1].replace(/\\"/g, '"');
+        if (explanationMatch) explanation = explanationMatch[1].replace(/\\"/g, '"');
+        if (dangerMatch) danger = dangerMatch[1].replace(/\\"/g, '"');
+      }
+      
+      if (!concept && !explanation && !danger) {
+        let cleanText = jsonStr.replace(/^[\{\s"']*/, '').replace(/["'\s:]*$/, '');
+        return `<p class="text-neutral-400 text-xs animate-pulse">${cleanText}...</p>`;
+      }
+
+      let mergedText = "";
+      if (concept) {
+        mergedText += `<span class="text-emerald-400 font-extrabold uppercase tracking-wider text-[10px] bg-neutral-900/80 px-1.5 py-0.5 rounded border border-neutral-800/80 mr-1.5">${concept}</span> `;
+      }
+      if (explanation) {
+        mergedText += explanation;
+      }
+      if (danger && danger.toLowerCase() !== "none") {
+        mergedText += ` <span class="text-rose-400 font-semibold">(Warning: ${danger})</span>`;
+      }
+
+      return `<div class="prose prose-invert text-xs leading-relaxed font-sans text-neutral-300 select-text">${mergedText}</div>`;
     };
 
     const displayCoachInsight = s => {
@@ -1361,7 +1576,7 @@ HTML = r"""
         return;
       }
       if (s.insight) {
-        el.innerHTML = `<div class="prose prose-invert text-lg leading-relaxed font-sans">${s.insight}</div>`;
+        el.innerHTML = renderCoachJSON(s.insight);
       } else if (s.classification === 'loading') {
         el.innerHTML = `<p class="text-neutral-500 italic animate-pulse">Waiting for engine classification...</p>`;
       } else {
@@ -1426,22 +1641,6 @@ HTML = r"""
 
       if (selectedMetric && s.positional_details && s.positional_details[selectedMetric]) {
         s.positional_details[selectedMetric].forEach(h => sh.push({ orig: h.orig, dest: h.dest, brush: h.brush, modifiers: h.modifiers || {}, reason: h.reason }));
-      }
-
-      if (s.worst_placed_piece && s.worst_placed_piece.worst_pieces_list) {
-        s.worst_placed_piece.worst_pieces_list.forEach(wpp => {
-          if ((showAllManeuvers || activeWppPaths.has(wpp.wpp_square)) && wpp.maneuver_path && wpp.maneuver_path.length >= 2) {
-            const path = wpp.maneuver_path;
-            for (let i = 0; i < path.length - 1; i++) {
-              sh.push({ orig: path[i], dest: path[i+1], brush: 'blue', modifiers: { lineWidth: 8 }, reason: `Maneuver path for worst-placed piece: ${wpp.wpp_name} (${path[i]} -> ${path[i+1]})` });
-            }
-          }
-        });
-      } else if ((showAllManeuvers || showWppPath) && s.worst_placed_piece && s.worst_placed_piece.maneuver_path && s.worst_placed_piece.maneuver_path.length >= 2) {
-        const path = s.worst_placed_piece.maneuver_path;
-        for (let i = 0; i < path.length - 1; i++) {
-          sh.push({ orig: path[i], dest: path[i+1], brush: 'blue', modifiers: { lineWidth: 8 }, reason: `Maneuver path for worst-placed piece: ${s.worst_placed_piece.wpp_name} (${path[i]} -> ${path[i+1]})` });
-        }
       }
 
       window.currentBoardMarkings = sh;
@@ -1549,29 +1748,25 @@ HTML = r"""
       const cardEl = $('wpp-card');
       if (!listEl || !cardEl) return;
       
-      if (wpp && wpp.worst_pieces_list && wpp.worst_pieces_list.length > 0) {
+      if (wpp && wpp.wpp_name) {
         cardEl.classList.remove('hidden');
-        
-        listEl.innerHTML = wpp.worst_pieces_list.map(item => {
-          const pct = Math.round(item.mobility_ratio * 100);
-          const isActive = showAllManeuvers || activeWppPaths.has(item.wpp_square);
-          
-          return `
-            <div class="py-1.5 px-2.5 rounded-xl bg-[#1d1d21]/50 border ${isActive ? 'border-blue-500/40 bg-blue-950/15' : 'border-neutral-800/40'} hover:bg-neutral-800/40 transition-all cursor-pointer flex flex-col gap-0.5" onclick="toggleSingleWppPath('${item.wpp_square}')">
-              <div class="flex items-center justify-between">
-                <div class="flex items-center gap-1.5 font-sans">
-                  <span class="w-2 h-2 rounded-full ${isActive ? 'bg-blue-400 animate-pulse' : 'bg-neutral-600'}"></span>
-                  <span class="text-xs font-bold text-neutral-200">${item.wpp_name}</span>
-                </div>
-                <span class="text-[10px] px-1.5 py-0.5 rounded bg-[#131316] text-neutral-400 font-semibold">${pct}% active</span>
+        const pct = Math.round((wpp.mobility_ratio || 0) * 100);
+        listEl.innerHTML = `
+          <div class="py-1.5 px-2.5 rounded-xl bg-[#1d1d21]/50 border border-neutral-800/40 hover:bg-neutral-800/40 transition-all flex flex-col gap-0.5">
+            <div class="flex items-center justify-between">
+              <div class="flex items-center gap-1.5 font-sans">
+                <span class="w-2 h-2 rounded-full bg-blue-400 animate-pulse"></span>
+                <span class="text-xs font-bold text-neutral-200">${wpp.wpp_name}</span>
               </div>
-              <div class="text-[10px] text-neutral-400 flex items-center gap-1 mt-0.5 font-mono">
-                <span class="text-blue-400 font-semibold">Path:</span>
-                <span>${item.maneuver_path.join(' ➔ ')}</span>
-              </div>
+              <span class="text-[10px] px-1.5 py-0.5 rounded bg-[#131316] text-neutral-400 font-semibold">${pct}% active</span>
             </div>
-          `;
-        }).join('');
+            <div class="text-[10px] text-neutral-400 flex items-center gap-1 mt-0.5 font-sans">
+              <i data-lucide="info" class="w-3 h-3 text-blue-400 shrink-0"></i>
+              <span>${wpp.wpp_reason || 'Needs improvement'}</span>
+            </div>
+          </div>
+        `;
+        lucide.createIcons();
       } else {
         cardEl.classList.remove('hidden');
         if (isLoading) {
@@ -1580,37 +1775,6 @@ HTML = r"""
           listEl.innerHTML = `<div class="flex flex-col items-center justify-center h-full text-neutral-500 text-xs font-sans text-center px-2">No worst-placed pieces detected. Position is balanced.</div>`;
         }
         lucide.createIcons();
-      }
-    };
-
-    const toggleWppDropdown = () => {};
-
-    const toggleSingleWppPath = sq => {
-      if (activeWppPaths.has(sq)) activeWppPaths.delete(sq);
-      else activeWppPaths.add(sq);
-      
-      if (states[currentIndex]) {
-        updateWppUI(states[currentIndex].worst_placed_piece);
-        updateMarkings(states[currentIndex]);
-      }
-    };
-
-    const toggleAllManeuvers = () => {
-      showAllManeuvers = !showAllManeuvers;
-      const btn = $('toggle-all-maneuvers-btn');
-      if (btn) {
-        if (showAllManeuvers) {
-          btn.className = 'px-2 py-0.5 rounded-md bg-blue-950/40 text-blue-400 border border-blue-500/30 text-[9px] font-bold uppercase tracking-wider hover:bg-blue-900/40 transition-all flex items-center gap-1 shrink-0';
-          btn.innerHTML = `<i data-lucide="eye-off" class="w-3 h-3"></i> Maneuvers`;
-        } else {
-          btn.className = 'px-2 py-0.5 rounded-md bg-[#202226] border border-neutral-800/80 text-[9px] font-bold uppercase tracking-wider text-neutral-300 hover:bg-[#282a2f] hover:text-white transition-all flex items-center gap-1 shrink-0';
-          btn.innerHTML = `<i data-lucide="eye" class="w-3 h-3 text-blue-400"></i> Maneuvers`;
-        }
-        lucide.createIcons();
-      }
-      if (states[currentIndex]) {
-        updateWppUI(states[currentIndex].worst_placed_piece);
-        updateMarkings(states[currentIndex]);
       }
     };
 
@@ -1813,7 +1977,7 @@ HTML = r"""
     $('tab-bar').innerHTML = TABS.map(t => `<button class="${tabClass(t.active)}" data-tab="${t.id}" onclick="switchTab('${t.id}')">${t.label}</button>`).join('');
     $('kbd-help').innerHTML = SHORTCUTS.map(([k,v]) => `<div class="flex justify-between items-center border-b border-neutral-800/20 pb-1.5"><span class="kbd">${k}</span><span class="text-[10px]">${v}</span></div>`).join('');
 
-    Object.assign(window, {navigate, toggleBoardOrientation, confirmReset, switchTab, loadCustomFen, copyCurrentFen, copyCurrentPgn, importPgn, selectMetric, toggleWppDropdown, toggleSingleWppPath, toggleAllManeuvers, toggleAnalysisColumn, toggleMute, toggleTheme});
+    Object.assign(window, {navigate, toggleBoardOrientation, confirmReset, switchTab, loadCustomFen, copyCurrentFen, copyCurrentPgn, importPgn, selectMetric, toggleAnalysisColumn, toggleMute, toggleTheme});
 
     const keyActions = {
       arrowleft:()=>navigate('back'), pageup:()=>navigate('back'), backspace:()=>navigate('back'),

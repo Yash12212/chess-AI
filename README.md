@@ -50,11 +50,13 @@ Real-time Stockfish evaluation · 11-class move classification · tactical board
 ### 🔬 Engine Analysis
 * ⚙️ **Stockfish Core** – Multi-threaded evaluation (depth-20, 0.20s limits) powering accurate centipawn and mating sequence computations.
 * 🏷️ **11-Class Move Classification** – Automatic classification badges (e.g., *Brilliant, Great, Best, Excellent, Good, Book, Forced, Inaccuracy, Mistake, Miss, Blunder*) rendered with distinct visual colors.
-* 🎨 **Tactical Annotations** – Displays tactical indicators directly on the board: best-move arrows, pins, forks, hanging pieces, open files, and LPDO (Loose Piece Drop Off) warnings with hover tooltips.
+* 🎨 **Tactical & Positional Annotations** – Displays indicators directly on the board: best-move arrows, pins, forks, hanging pieces, open files, LPDO warnings, outpost highlights, pawn endgame Rule of the Square boxes, back-rank escape alarms, and knight BFS routing paths.
+* 🧹 **De-cluttering Signal Pipeline** – Prevents visual arrow overload on the board in complex positions by filtering signals using priority levels (Critical, High, Medium, Low).
 * 📈 **Game Stats & Accuracy** – Detailed analysis metrics including arithmetic and harmonic accuracy scores for both colors.
 
 ### 🤖 Intelligent AI Coach
-* ✍️ **Streaming Grandmaster Coach** – Explains the *why* behind every single move using a structured data pipeline.
+* ✍️ **Streaming Grandmaster Coach** – Explains the *why* behind every single move using a structured JSON data pipeline, unified on the frontend into a clean, readable text card.
+* 🛡️ **Post-Validation Guard** – Parses and cross-references LLM evaluation text with engine telemetry, correcting hallucinations or mismatching numerical scores in real time.
 * 🔌 **Dual Providers** – Run completely offline using **Ollama (Qwen)** or leverage cloud inference via **Google Gemini**.
 * 📖 **Opening Database** – Instantly detects 3,402 distinct chess openings for instant classification.
 
@@ -163,6 +165,10 @@ The overall game-level accuracy is calculated using a blended arithmetic and har
 | **Fork Detection** | Detects moves that simultaneously attack multiple high-value enemy targets. | Orange lines linking target pieces. |
 | **King-Shield weakening** | Flags f/g/h pawn pushes in front of a castled king that weaken its protection. | Red alert rings around the king. |
 | **Open Rook Files** | Recognizes newly opened or semi-opened files created by pawn movement. | Blue highlighted files. |
+| **Outpost Finder** | Identifies advanced squares for Knights and Bishops supported by pawns. | Purple highlighted circles. |
+| **Rule of the Square** | Dynamic bounding boxes showing if a king can catch a passed pawn in endgame. | Blue dashed squares. |
+| **"Luft" Alarm** | Warns if castled king has back-rank mate risk (no escape square). | Orange border on king. |
+| **Knight BFS Paths** | Calculates and draws the shortest knight route to optimal outposts. | Orange dashed arrows. |
 | **Game-Phase Engine** | Dynamically classifies the position (Opening, Middlegame, Endgame) to guide the coach's tone. | Updates dashboard metrics. |
 
 > [!TIP]
@@ -172,28 +178,22 @@ The overall game-level accuracy is calculated using a blended arithmetic and har
 
 ### The LLM Coach Pipeline
 
-Rather than feeding raw chess coordinates directly to the AI, the server constructs a highly descriptive, feature-rich context block:
+Rather than feeding raw chess coordinates directly to the AI, the server constructs a highly descriptive, feature-rich context block containing the move classification, evaluation, active tactical threats, refutations, and positional features.
 
-```yaml
-# Context fed to LLM
-Data:
-  Player: White
-  Phase: Middlegame
-  Class: Mistake
-  Eval: -1.40
-  Played Move: Bb4
-  Opponent Refutation: Opponent can play Nxe4 to gain a material advantage of 2 points
-  Refutation PV: 1. Nxe4, 2. Qxe4, 3. ...
-  Best Alternative: Rad1
-  Opening: Italian Game
-
-Instructions:
-  1. Explain that White played Bb4, which is a mistake because it concedes a clear advantage.
-  2. Conclude by writing: The refutation is exactly: Nxe4.
-  3. Write exactly two sentences. Never repeat the evaluation. No meta-text.
+The LLM is then prompted to respond in a structured JSON schema:
+```json
+{
+  "thematic_concept": "Positional mistake",
+  "explanation": "White played Bb4, which is a mistake because it allows the opponent to execute Nxe4, gaining a clear advantage.",
+  "tactical_danger_if_ignored": "The knight on e4 will become highly active and attack the central pawns."
+}
 ```
 
-An output cleaning filter (`clean_meta_text`) strips common LLM conversational filler (e.g., *"As requested...", "Based on the data..."*), ensuring clean, streamed grandmaster feedback.
+### 🛡️ Post-Processing Context Validation
+To guarantee high-quality analysis:
+1. **JSON Shielding:** If the model generates malformed JSON, a backend fallback automatically wraps the raw text into a valid JSON structure so the application frontend never crashes.
+2. **Telemetry Alignment:** A regex analyzer scans the explanation text and replaces any hallucinated evaluations (e.g. "+1.5" or forced mate values) with the actual Stockfish engine values.
+3. **Unified Frontend Render:** The client-side UI parses the JSON stream in real time and merges the fields into a single, cohesive grandmaster commentary flow, complete with styled theme headers and tactical warning tags.
 
 ---
 
@@ -518,11 +518,11 @@ These features are under development to enhance game analysis and training outco
 
 - [ ] **Multi-candidate engine paths** – Visualize the top three candidate moves using distinct colored arrows.
 - [ ] **Long-range sniper warnings** – Display dotted warning arrows indicating potential discovered attacks.
-- [ ] **Outpost square finder** – Highlight key square outposts for minor pieces.
-- [ ] **Rule of the Square visualizer** – Show dynamic bounds of pawn-to-king races in pawn endgames.
-- [ ] **Escape Squares ("Luft" Alarm)** – Alert on king safety vulnerability and recommend pawn-push escapes.
+- [x] **Outpost square finder** – Highlight key square outposts for minor pieces.
+- [x] **Rule of the Square visualizer** – Show dynamic bounds of pawn-to-king races in pawn endgames.
+- [x] **Escape Squares ("Luft" Alarm)** – Alert on king safety vulnerability and recommend pawn-push escapes.
 - [ ] **Overloaded defender alerts** – Map and flag defensive pieces carrying multiple responsibilities.
-- [ ] **Knight maneuver routes** – Draw BFS-calculated knight routes pointing directly to minor piece outposts.
+- [x] **Knight maneuver routes** – Draw BFS-calculated knight routes pointing directly to minor piece outposts.
 
 ---
 

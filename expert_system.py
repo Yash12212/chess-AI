@@ -6,7 +6,6 @@ import threading
 import atexit
 import logging
 from pathlib import Path
-from collections import deque
 
 import chess
 import chess.engine
@@ -92,6 +91,50 @@ class ExpertEngineManager:
 
 expert_eng = ExpertEngineManager()
 atexit.register(expert_eng.close)
+
+
+def get_annotation_priority(ann: dict) -> str:
+    """Returns priority level ('Critical', 'High', 'Medium', 'Low') for an annotation (Phase 5)."""
+    reason = ann.get("reason", "").lower()
+    brush = ann.get("brush", "").lower()
+    
+    # Priority by keywords in the reason
+    if any(k in reason for k in ["mate", "checkmate", "hanging queen", "queen under attack"]):
+        return "Critical"
+    if any(k in reason for k in ["threat", "hanging", "attacked", "fork", "pin", "tactical"]):
+        return "High"
+    if any(k in reason for k in ["open file", "semi-open", "outpost", "space", "positional"]):
+        return "Medium"
+    if any(k in reason for k in ["develop", "center", "quiet", "castling", "king safety"]):
+        return "Low"
+        
+    # Fallback by brush color if keyword is not found
+    if brush == "red":
+        return "High"
+    elif brush in ("yellow", "blue"):
+        return "Medium"
+    else:
+        return "Low"
+
+
+def prioritize_annotations(arrows: list, circles: list) -> tuple[list, list]:
+    """Filters arrows and circles based on their priority levels to avoid visual clutter (Phase 5)."""
+    prioritized_arrows = [(a, get_annotation_priority(a)) for a in arrows]
+    prioritized_circles = [(c, get_annotation_priority(c)) for c in circles]
+    
+    all_priorities = {p for _, p in prioritized_arrows} | {p for _, p in prioritized_circles}
+    
+    if "Critical" in all_priorities:
+        keep = {"Critical", "High"}
+    elif "High" in all_priorities:
+        keep = {"High", "Medium"}
+    else:
+        keep = {"Critical", "High", "Medium", "Low"}
+        
+    filtered_arrows = [a for a, p in prioritized_arrows if p in keep]
+    filtered_circles = [c for c, p in prioritized_circles if p in keep]
+    
+    return filtered_arrows, filtered_circles
 
 
 def get_annotations(prev_fen: str, move_uci: str) -> dict:
@@ -414,7 +457,7 @@ def _eval_scores(prev_board, board):
         try:
             with expert_eng.lock:
                 r = engine.analyse(b, chess.engine.Limit(time=0.10, depth=10))
-            out.append(score_val(r.get("score")))
+                out.append(score_val(r.get("score")))
         except Exception:
             out.append(None)
     return out[0], out[1]
@@ -437,6 +480,7 @@ def _king_shield_weakened(prev_board, player_move, player_color) -> bool:
         king_sq = prev_board.king(player_col)
         if king_sq is None: return False
         ff, fr = chess.square_file(player_move.from_square), chess.square_rank(player_move.from_square)
+        if ff in (3, 4): return False
         kf = chess.square_file(king_sq)
         target_rank = 1 if player_col == chess.WHITE else 6
         return fr == target_rank and abs(ff - kf) <= 1
@@ -529,26 +573,26 @@ def prepare_coach_context(data: dict) -> dict:
     if not is_checkmate:
         curr_threat = data.get("threat") or (_null_move_threat(board, player_color, "threatens", require_minor_pieces=True) if board else None)
 
-        prev_threat_uci = data.get("prev_threat_uci")
-        if prev_threat_uci and prev_board:
-            try:
-                threat_move = chess.Move.from_uci(prev_threat_uci)
-                desc = f"{opponent_color} threatened to play {prev_board.san(threat_move)}"
-                victim = prev_board.piece_at(threat_move.to_square)
-                if victim:
-                    vc = "White" if victim.color == chess.WHITE else "Black"
-                    desc += f" to capture {vc}'s {chess.piece_name(victim.piece_type)} on {chess.square_name(threat_move.to_square)}"
-                prev_threat = {"threat_move_uci": prev_threat_uci, "threat_description": desc}
-            except Exception:
-                prev_threat = None
+    prev_threat_uci = data.get("prev_threat_uci")
+    if prev_threat_uci and prev_board:
+        try:
+            threat_move = chess.Move.from_uci(prev_threat_uci)
+            desc = f"{opponent_color} threatened to play {prev_board.san(threat_move)}"
+            victim = prev_board.piece_at(threat_move.to_square)
+            if victim:
+                vc = "White" if victim.color == chess.WHITE else "Black"
+                desc += f" to capture {vc}'s {chess.piece_name(victim.piece_type)} on {chess.square_name(threat_move.to_square)}"
+            prev_threat = {"threat_move_uci": prev_threat_uci, "threat_description": desc}
+        except Exception:
+            prev_threat = None
 
-        if prev_threat is None and prev_board:
-            prev_threat = _null_move_threat(prev_board, opponent_color, "threatened")
+    if prev_threat is None and prev_board:
+        prev_threat = _null_move_threat(prev_board, opponent_color, "threatened")
 
-        refutation = perform_refutation_analysis(board) if (board and is_bad_move) else None
-        if prev_board and player_move and prev_threat:
-            try: threat_resolution = verify_threat_resolution(prev_board, player_move, prev_threat)
-            except Exception: pass
+    refutation = perform_refutation_analysis(board) if (board and is_bad_move) else None
+    if prev_board and player_move and prev_threat:
+        try: threat_resolution = verify_threat_resolution(prev_board, player_move, prev_threat)
+        except Exception: pass
 
     fork_made = ""
     new_open_rooks, new_semi_rooks = [], []
@@ -563,10 +607,14 @@ def prepare_coach_context(data: dict) -> dict:
         except Exception as e:
             logger.error("Error calculating positional deltas: %s", e)
 
-    wpp_info = data.get("worst_placed_piece")
-    if not wpp_info and board:
-        try: wpp_info = WorstPlacedPieceAnalyzer(board).get_wpp()
-        except Exception as e: logger.error("Error calculating WPP: %s", e); wpp_info = None
+    wpp_info = None
+    if board:
+        try:
+            player_col = chess.WHITE if player_color == "White" else chess.BLACK
+            wpp_info = WorstPlacedPieceAnalyzer(board, turn=player_col).get_wpp()
+        except Exception as e:
+            logger.error("Error calculating WPP: %s", e)
+            wpp_info = None
 
     eval_context = f"(Matches standard theory despite engine eval of {eval_str}.)" if ev is not None and not is_bad_move and cls_label == "book" and not is_checkmate else ""
     is_forced_mate = not is_checkmate and ev is not None and isinstance(ev, str) and "M" in ev
@@ -603,7 +651,7 @@ def prepare_coach_context(data: dict) -> dict:
         },
         "strategy": {
             "worst_placed_piece": wpp_info.get("wpp_name") if wpp_info else None,
-            "maneuver_path": wpp_info.get("maneuver_path") if wpp_info else None,
+            "wpp_reason": wpp_info.get("wpp_reason") if wpp_info else None,
             "rook_files": new_open_rooks + new_semi_rooks
         }
     }
@@ -616,6 +664,9 @@ def prepare_coach_context(data: dict) -> dict:
         "is_checkmate": is_checkmate, "is_forced_mate": is_forced_mate, "move_purpose": move_purpose,
         "benefit_detail": " and ".join(benefits), "eval_desc": get_eval_description(ev, player_color),
         "refutation_pv": refutation["refutation_pv"] if refutation else "",
+        "worst_placed_piece": wpp_info.get("wpp_name") if wpp_info else None,
+        "wpp_reason": wpp_info.get("wpp_reason") if wpp_info else None,
+        "features": features,
     }
 
 
@@ -631,6 +682,25 @@ class PositionalAggregator:
                 "structure": self.analyze_pawn_structure()
             }
         return self._cache
+
+    def _verify_outpost_value(self, sq: chess.Square, piece: chess.Piece) -> bool:
+        """Confirm via Stockfish that the piece is stable on its outpost (not moved away in PV)."""
+        engine = expert_eng.get()
+        if engine is None:
+            return True
+        try:
+            with expert_eng.lock:
+                pv = engine.analyse(self.board.copy(), chess.engine.Limit(time=0.08, depth=12)).get("pv", [])
+            if not pv:
+                return True
+            temp = self.board.copy()
+            for mv in pv[:4]:
+                if temp.turn == piece.color and mv.from_square == sq:
+                    return False
+                temp.push(mv)
+            return True
+        except Exception:
+            return True
 
     def analyze_space(self):
         white_pts = black_pts = 0.0
@@ -669,7 +739,7 @@ class PositionalAggregator:
             if piece and piece.piece_type in (chess.KNIGHT, chess.BISHOP):
                 is_defended_by_pawn = any(self.board.piece_type_at(s) == chess.PAWN for s in self.board.attackers(piece.color, sq))
                 no_opp_pawn = not _pawn_can_attack(self.board, sq, not piece.color)
-                if is_defended_by_pawn and no_opp_pawn:
+                if is_defended_by_pawn and no_opp_pawn and self._verify_outpost_value(sq, piece):
                     color_name = "White" if piece.color == chess.WHITE else "Black"
                     brush = "green" if piece.color == chess.WHITE else "red"
                     if piece.color == chess.WHITE and rank >= 4:
@@ -721,8 +791,8 @@ class PositionalAggregator:
                             has_own = True
                             in_front = (r > kr) if color == chess.WHITE else (r < kr)
                             if in_front and (own_pawn_rank is None or
-                                             (color == chess.WHITE and r < own_pawn_rank) or
-                                             (color == chess.BLACK and r > own_pawn_rank)):
+                                (color == chess.WHITE and r < own_pawn_rank) or
+                                (color == chess.BLACK and r > own_pawn_rank)):
                                 own_pawn_rank = r
                         else:
                             has_opp = True
@@ -794,8 +864,8 @@ class PositionalAggregator:
                             score -= 0.15
                             highlights.append({"orig": sq_name, "brush": "red", "reason": f"{color_name} Backward pawn on {sq_name}"})
 
-            if color == chess.WHITE: w_score = score
-            else: b_score = score
+                if color == chess.WHITE: w_score = score
+                else: b_score = score
 
         score_diff = max(-1.0, min(1.0, w_score - b_score))
         return score_diff, highlights
@@ -810,41 +880,26 @@ class PositionalAggregator:
 
 
 class WorstPlacedPieceAnalyzer:
-    def __init__(self, board: chess.Board):
+    def __init__(self, board: chess.Board, turn: chess.Color | None = None):
         self.board = board
-        self.turn = board.turn
-
-    def _temp_move_piece(self, start, target, piece):
-        original_at_target = self.board.piece_at(target)
-        original_at_start = self.board.piece_at(start)
-        self.board.remove_piece_at(start)
-        self.board.set_piece_at(target, piece)
-        def restore():
-            if original_at_start: self.board.set_piece_at(start, original_at_start)
-            else: self.board.remove_piece_at(start)
-            if original_at_target: self.board.set_piece_at(target, original_at_target)
-            else: self.board.remove_piece_at(target)
-        return restore
+        self.turn = board.turn if turn is None else turn
 
     def _get_piece_destinations(self, sq, piece):
-        """Static move generator for BFS pathing. Includes 1 and 2 square pushes for pawns."""
+        """Static move generator for mobility counting."""
         if piece.piece_type == chess.PAWN:
             dests = set()
-            direction = 8 if piece.color == chess.WHITE else -8
+            r, f = chess.square_rank(sq), chess.square_file(sq)
+            direction = 1 if piece.color == chess.WHITE else -1
             start_rank = 1 if piece.color == chess.WHITE else 6
             
-            # 1-square push
-            push1 = sq + direction
-            if 0 <= push1 <= 63 and not self.board.piece_at(push1):
-                dests.add(push1)
-                
-                # 2-square push from starting rank
-                if chess.square_rank(sq) == start_rank:
-                    push2 = sq + (direction * 2)
-                    if 0 <= push2 <= 63 and not self.board.piece_at(push2):
-                        dests.add(push2)
+            r1 = r + direction
+            if 0 <= r1 <= 7 and not self.board.piece_at(chess.square(f, r1)):
+                dests.add(chess.square(f, r1))
+                if r == start_rank:
+                    r2 = r + 2 * direction
+                    if 0 <= r2 <= 7 and not self.board.piece_at(chess.square(f, r2)):
+                        dests.add(chess.square(f, r2))
                         
-            # Captures
             for atk in self.board.attacks(sq):
                 target = self.board.piece_at(atk)
                 if target and target.color != piece.color:
@@ -853,9 +908,6 @@ class WorstPlacedPieceAnalyzer:
         else:
             return [sq2 for sq2 in self.board.attacks(sq)
                     if (p := self.board.piece_at(sq2)) is None or p.color != piece.color]
-
-    def _is_piece_safe_on(self, sq, piece) -> bool:
-        return _see(self.board, sq, piece.color, piece.piece_type)
 
     def get_piece_mobility_ratio(self, square: chess.Square) -> float:
         piece = self.board.piece_at(square)
@@ -870,121 +922,9 @@ class WorstPlacedPieceAnalyzer:
             if same_color >= 5: actual_moves = max(0, actual_moves - 2)
         return actual_moves / max_mobility[piece.piece_type]
 
-    def get_accessible_squares_at(self, curr_sq, start_sq, piece) -> list:
-        """Returns safe squares reachable from curr_sq. Uses pseudo-legal checks to avoid turn-alternation hacks."""
-        on_start = curr_sq == start_sq
-        restore_outer = None if on_start else self._temp_move_piece(start_sq, curr_sq, piece)
-        try:
-            safe = []
-            for dest in self._get_piece_destinations(curr_sq, piece):
-                move = chess.Move(curr_sq, dest)
-                # Check legality without pushing to avoid moving pinned pieces or exposing the king
-                if move not in self.board.legal_moves:
-                    continue
-                r = self._temp_move_piece(curr_sq, dest, piece)
-                if self._is_piece_safe_on(dest, piece):
-                    safe.append(dest)
-                r()
-            return safe
-        finally:
-            if restore_outer:
-                restore_outer()
-
-    def is_target_good_square_at(self, square, start_sq, piece, current_eval) -> bool:
-        """Evaluates if the target square is an ideal post for the specific piece type."""
-        if square == start_sq: return False
-        
-        # 1. Evaluate strategic value first (fast Python logic)
-        rank, file = chess.square_rank(square), chess.square_file(square)
-        opp = not piece.color
-        is_strategic = False
-        
-        if piece.piece_type == chess.PAWN:
-            is_passed = not any(self.board.piece_at(chess.square(af, ar)) == chess.Piece(chess.PAWN, opp) for af in [file-1, file, file+1] if 0 <= af <= 7 for ar in (range(rank+1, 8) if piece.color == chess.WHITE else range(0, rank)))
-            in_center = file in (2,3,4,5) and rank in (2,3,4,5)
-            is_strategic = is_passed or in_center
-            
-        elif piece.piece_type in (chess.KNIGHT, chess.BISHOP):
-            in_opp = rank >= 4 if piece.color == chess.WHITE else rank <= 3
-            in_center = rank in (2,3,4,5) and file in (2,3,4,5)
-            if (in_opp or in_center) and not _pawn_can_attack(self.board, square, opp):
-                is_strategic = True
-            
-        elif piece.piece_type == chess.ROOK:
-            is_seventh = (piece.color == chess.WHITE and rank == 6) or (piece.color == chess.BLACK and rank == 1)
-            file_pawns = [p for r in range(8) if (p := self.board.piece_at(chess.square(file, r))) and p.piece_type == chess.PAWN]
-            is_open = not file_pawns
-            is_semi = not any(p.color == piece.color for p in file_pawns) and not is_open
-            is_strategic = is_seventh or is_open or is_semi
-            
-        elif piece.piece_type == chess.QUEEN:
-            in_center = rank in (2,3,4,5) and file in (2,3,4,5)
-            if in_center:
-                is_strategic = True
-            else:
-                ratio = self.get_piece_mobility_ratio(square)
-                is_strategic = ratio > 0.5
-                
-        if not is_strategic:
-            return False
-
-        # 2. Only if the square is strategically desirable, run the heavy engine and safety checks
-        restore = self._temp_move_piece(start_sq, square, piece)
-        is_safe = False
-        if self._is_piece_safe_on(square, piece):
-            is_safe = True
-            engine = expert_eng.get()
-            if engine:
-                try:
-                    with expert_eng.lock:
-                        info = engine.analyse(self.board, chess.engine.Limit(time=0.03, depth=8))
-                    score = info.get("score")
-                    if score:
-                        if score.is_mate():
-                            m = score.relative.mate()
-                            if m is not None and m < 0: is_safe = False
-                        else:
-                            val = score.relative.score()
-                            if val is not None and val < current_eval - 100: is_safe = False
-                except Exception as e:
-                    logger.error("Stockfish safety check failed: %s", e)
-        restore()
-        return is_safe
-
-    def find_maneuver_path(self, start_sq, piece, current_eval) -> list:
-        queue = deque([(start_sq, [start_sq])])
-        visited = {start_sq}
-        max_depth = 4
-        while queue:
-            curr_sq, path = queue.popleft()
-            if curr_sq != start_sq and self.is_target_good_square_at(curr_sq, start_sq, piece, current_eval):
-                return [chess.square_name(sq) for sq in path]
-            if len(path) - 1 >= max_depth: continue
-            for next_sq in self.get_accessible_squares_at(curr_sq, start_sq, piece):
-                if next_sq not in visited:
-                    visited.add(next_sq)
-                    queue.append((next_sq, path + [next_sq]))
-        return []
-
     def get_wpp(self) -> dict:
         side_pieces = []
         is_opening = self.board.fullmove_number <= 12
-        current_eval = 0
-        engine = expert_eng.get()
-        if engine:
-            try:
-                with expert_eng.lock:
-                    info = engine.analyse(self.board, chess.engine.Limit(time=0.03, depth=8))
-                score = info.get("score")
-                if score:
-                    if score.is_mate():
-                        m = score.relative.mate()
-                        current_eval = -20000 if m and m < 0 else 20000
-                    else:
-                        val = score.relative.score()
-                        current_eval = val if val is not None else 0
-            except Exception as e:
-                logger.error("Error getting current eval in get_wpp: %s", e)
 
         start_squares = {
             (chess.WHITE, chess.KNIGHT): {chess.B1, chess.G1}, (chess.WHITE, chess.BISHOP): {chess.C1, chess.F1},
@@ -995,45 +935,44 @@ class WorstPlacedPieceAnalyzer:
         king_start = {chess.WHITE: chess.E1, chess.BLACK: chess.E8}
 
         for square, piece in self.board.piece_map().items():
-            if piece.color != self.turn or piece.piece_type == chess.KING: continue
+            # Pawns and Kings are excluded as they do not "maneuver" like pieces
+            if piece.color != self.turn or piece.piece_type in (chess.KING, chess.PAWN): continue
             if piece.piece_type == chess.ROOK and is_opening: continue
 
             ratio = self.get_piece_mobility_ratio(square)
             sort_ratio = ratio
+            reason = "least active piece"
 
+            # Penalize pieces heavily if they are stuck on their starting squares
             if piece.piece_type in (chess.KNIGHT, chess.BISHOP) and square in start_squares.get((piece.color, piece.piece_type), set()):
-                sort_ratio += 0.50
+                sort_ratio -= 0.60
+                reason = "undeveloped and needs to be brought into the game"
             if piece.piece_type == chess.ROOK and square in rook_start[piece.color]:
                 has_castling = self.board.has_kingside_castling_rights(piece.color) or self.board.has_queenside_castling_rights(piece.color)
                 king_on_start = self.board.king(piece.color) == king_start[piece.color]
-                if king_on_start or has_castling: sort_ratio += 0.50
+                if king_on_start or has_castling:
+                    sort_ratio -= 0.40
+                    reason = "unactivated and trapped behind pawns"
             if piece.piece_type == chess.QUEEN and square in start_squares.get((piece.color, chess.QUEEN), set()):
-                sort_ratio += 0.30
+                sort_ratio -= 0.20
+                reason = "passive on its starting square"
 
-            side_pieces.append((square, piece, ratio, sort_ratio))
+            if ratio < 0.3 and sort_ratio >= 0:
+                reason = "lacking mobility and restricted"
+
+            side_pieces.append((square, piece, ratio, sort_ratio, reason))
 
         if not side_pieces:
-            return {"worst_pieces_list": [], "wpp_square": "", "wpp_name": "", "mobility_ratio": 1.0, "maneuver_path": []}
+            return {}
 
+        # Sort ascending so the most negative (worst placed) comes first
         side_pieces.sort(key=lambda x: (x[3], (x[0] * 17) % 64))
-        worst_pieces_list = []
-        for sq, piece, ratio, _ in side_pieces:
-            name = f"{chess.piece_name(piece.piece_type).capitalize()} on {chess.square_name(sq)}"
-            path = self.find_maneuver_path(sq, piece, current_eval)
-            # Only include in list if a valid maneuver path exists
-            if not path:
-                continue
-            worst_pieces_list.append({
-                "wpp_square": chess.square_name(sq), "wpp_name": name,
-                "mobility_ratio": round(ratio, 2), "maneuver_path": path
-            })
-
-        if not worst_pieces_list:
-            return {"worst_pieces_list": [], "wpp_square": "", "wpp_name": "", "mobility_ratio": 1.0, "maneuver_path": []}
-
-        primary = worst_pieces_list[0]
+        sq, piece, ratio, _, reason = side_pieces[0]
+        name = f"{chess.piece_name(piece.piece_type).capitalize()} on {chess.square_name(sq)}"
+        
         return {
-            "worst_pieces_list": worst_pieces_list, "wpp_square": primary["wpp_square"],
-            "wpp_name": primary["wpp_name"], "mobility_ratio": primary["mobility_ratio"],
-            "maneuver_path": primary["maneuver_path"]
+            "wpp_square": chess.square_name(sq), 
+            "wpp_name": name,
+            "mobility_ratio": round(ratio, 2), 
+            "wpp_reason": reason
         }
