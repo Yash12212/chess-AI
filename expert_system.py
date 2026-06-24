@@ -48,7 +48,7 @@ class ExpertEngineManager:
     """Manages an auxiliary Stockfish instance to compute threats and refutations."""
     def __init__(self):
         self._e = None
-        self.lock = threading.Lock()
+        self.lock = threading.RLock()
 
     def _get_path(self) -> str:
         try:
@@ -62,6 +62,16 @@ class ExpertEngineManager:
 
     def get(self) -> chess.engine.SimpleEngine | None:
         with self.lock:
+            if self._e:
+                try:
+                    self._e.ping()
+                except Exception as e:
+                    logger.warning("Expert Stockfish safety check failed: %s. Restarting engine.", e)
+                    try:
+                        self._e.quit()
+                    except Exception:
+                        pass
+                    self._e = None
             if not self._e:
                 try:
                     self._e = chess.engine.SimpleEngine.popen_uci(self._get_path())
@@ -884,8 +894,42 @@ class WorstPlacedPieceAnalyzer:
         """Evaluates if the target square is an ideal post for the specific piece type."""
         if square == start_sq: return False
         
+        # 1. Evaluate strategic value first (fast Python logic)
+        rank, file = chess.square_rank(square), chess.square_file(square)
+        opp = not piece.color
+        is_strategic = False
+        
+        if piece.piece_type == chess.PAWN:
+            is_passed = not any(self.board.piece_at(chess.square(af, ar)) == chess.Piece(chess.PAWN, opp) for af in [file-1, file, file+1] if 0 <= af <= 7 for ar in (range(rank+1, 8) if piece.color == chess.WHITE else range(0, rank)))
+            in_center = file in (2,3,4,5) and rank in (2,3,4,5)
+            is_strategic = is_passed or in_center
+            
+        elif piece.piece_type in (chess.KNIGHT, chess.BISHOP):
+            in_opp = rank >= 4 if piece.color == chess.WHITE else rank <= 3
+            in_center = rank in (2,3,4,5) and file in (2,3,4,5)
+            if (in_opp or in_center) and not _pawn_can_attack(self.board, square, opp):
+                is_strategic = True
+            
+        elif piece.piece_type == chess.ROOK:
+            is_seventh = (piece.color == chess.WHITE and rank == 6) or (piece.color == chess.BLACK and rank == 1)
+            file_pawns = [p for r in range(8) if (p := self.board.piece_at(chess.square(file, r))) and p.piece_type == chess.PAWN]
+            is_open = not file_pawns
+            is_semi = not any(p.color == piece.color for p in file_pawns) and not is_open
+            is_strategic = is_seventh or is_open or is_semi
+            
+        elif piece.piece_type == chess.QUEEN:
+            in_center = rank in (2,3,4,5) and file in (2,3,4,5)
+            if in_center:
+                is_strategic = True
+            else:
+                ratio = self.get_piece_mobility_ratio(square)
+                is_strategic = ratio > 0.5
+                
+        if not is_strategic:
+            return False
+
+        # 2. Only if the square is strategically desirable, run the heavy engine and safety checks
         restore = self._temp_move_piece(start_sq, square, piece)
-        ratio = self.get_piece_mobility_ratio(square)
         is_safe = False
         if self._is_piece_safe_on(square, piece):
             is_safe = True
@@ -905,35 +949,7 @@ class WorstPlacedPieceAnalyzer:
                 except Exception as e:
                     logger.error("Stockfish safety check failed: %s", e)
         restore()
-        if not is_safe: return False
-
-        rank, file = chess.square_rank(square), chess.square_file(square)
-        opp = not piece.color
-        
-        if piece.piece_type == chess.PAWN:
-            is_passed = not any(self.board.piece_at(chess.square(af, ar)) == chess.Piece(chess.PAWN, opp) for af in [file-1, file, file+1] if 0 <= af <= 7 for ar in (range(rank+1, 8) if piece.color == chess.WHITE else range(0, rank)))
-            in_center = file in (2,3,4,5) and rank in (2,3,4,5)
-            return is_passed or in_center
-            
-        elif piece.piece_type in (chess.KNIGHT, chess.BISHOP):
-            in_opp = rank >= 4 if piece.color == chess.WHITE else rank <= 3
-            in_center = rank in (2,3,4,5) and file in (2,3,4,5)
-            if not (in_opp or in_center): return False
-            if _pawn_can_attack(self.board, square, opp): return False
-            return True
-            
-        elif piece.piece_type == chess.ROOK:
-            is_seventh = (piece.color == chess.WHITE and rank == 6) or (piece.color == chess.BLACK and rank == 1)
-            file_pawns = [p for r in range(8) if (p := self.board.piece_at(chess.square(file, r))) and p.piece_type == chess.PAWN]
-            is_open = not file_pawns
-            is_semi = not any(p.color == piece.color for p in file_pawns) and not is_open
-            return is_seventh or is_open or is_semi
-            
-        elif piece.piece_type == chess.QUEEN:
-            in_center = rank in (2,3,4,5) and file in (2,3,4,5)
-            return in_center or ratio > 0.5
-            
-        return False
+        return is_safe
 
     def find_maneuver_path(self, start_sq, piece, current_eval) -> list:
         queue = deque([(start_sq, [start_sq])])

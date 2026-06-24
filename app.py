@@ -130,23 +130,37 @@ def sf_path():
 class EngineManager:
     def __init__(self):
         self._e = None
-        self.lock = threading.Lock()
+        self.lock = threading.RLock()
 
-    def get(self):
-        if not self._e:
-            p = sf_path()
-            logger.info("Starting Stockfish: %s", p)
-            self._e = chess.engine.SimpleEngine.popen_uci(p)
-            try:
-                self._e.configure({"Threads": SF_THREADS, "Hash": SF_HASH})
-            except Exception as e:
-                logger.error("Config failed: %s", e)
-        return self._e
+    def get(self) -> chess.engine.SimpleEngine:
+        with self.lock:
+            if self._e:
+                try:
+                    self._e.ping()
+                except Exception as e:
+                    logger.warning("Main Stockfish safety check failed: %s. Restarting engine.", e)
+                    try:
+                        self._e.quit()
+                    except Exception:
+                        pass
+                    self._e = None
+            if not self._e:
+                p = sf_path()
+                logger.info("Starting Stockfish: %s", p)
+                self._e = chess.engine.SimpleEngine.popen_uci(p)
+                try:
+                    self._e.configure({"Threads": SF_THREADS, "Hash": SF_HASH})
+                except Exception as e:
+                    logger.error("Config failed: %s", e)
+            assert self._e is not None
+            return self._e
 
     def close(self):
-        if self._e:
-            try: self._e.quit()
-            except: pass
+        with self.lock:
+            if self._e:
+                try: self._e.quit()
+                except: pass
+                self._e = None
 
 eng = EngineManager()
 
@@ -611,6 +625,53 @@ HTML = r"""
     ::-webkit-scrollbar-thumb{background:#2a2a2e;border-radius:99px}
     ::-webkit-scrollbar-thumb:hover{background:#3a3a3e}
     #board .last-move{background:var(--last-move-bg, rgba(255,255,255,0.12))!important}
+
+    /* ── Light Theme ── */
+    [data-theme="light"] { --last-move-bg: rgba(0,0,0,0.08); }
+    [data-theme="light"] body { background: linear-gradient(135deg, #f0f2f8 0%, #e8ecf4 50%, #f2f0ee 100%) !important; color: #1f2937 !important; }
+    [data-theme="light"] .card { background: rgba(255,255,255,0.85) !important; border-color: #c9d0dc !important; box-shadow: 0 2px 12px rgba(0,0,0,0.06) !important; }
+    [data-theme="light"] header { background: linear-gradient(135deg, rgba(255,255,255,0.95), rgba(240,248,245,0.92)) !important; border-color: #c9d0dc !important; }
+    [data-theme="light"] .panel, [data-theme="light"] #move-list { background: rgba(235,240,250,0.7) !important; border-color: #d4dae6 !important; }
+    [data-theme="light"] #coach-panel { background: rgba(230,248,240,0.5) !important; border-color: #c2e0d3 !important; }
+    [data-theme="light"] .btn, [data-theme="light"] .kbd, [data-theme="light"] #turn-indicator, [data-theme="light"] #opening-badge,
+    [data-theme="light"] .bg-\[\#202226\], [data-theme="light"] .bg-\[\#1c1c21\], [data-theme="light"] .bg-\[\#0c0c0e\],
+    [data-theme="light"] .bg-\[\#1d1d21\]\/50, [data-theme="light"] .bg-\[\#131316\], [data-theme="light"] .bg-\[\#131316\]\/60,
+    [data-theme="light"] .bg-\[\#18181c\]\/95, [data-theme="light"] .bg-\[\#2b2d31\]\/60,
+    [data-theme="light"] .bg-\[\#0e0e11\]\/40 { background: #e4e8f0 !important; border-color: #c9d0dc !important; color: #374151 !important; }
+    [data-theme="light"] #tab-bar { background: #dce2ee !important; border-color: #c2cad8 !important; }
+    [data-theme="light"] .btn:hover, [data-theme="light"] .hover\:bg-\[\#35373c\]:hover { background: #d4d9e4 !important; color: #111827 !important; }
+    [data-theme="light"] .btn-em { background: rgba(16,185,129,0.12) !important; border-color: rgba(16,185,129,0.35) !important; color: #047857 !important; }
+    [data-theme="light"] .input { background: #fff !important; border-color: #c2cad8 !important; color: #1f2937 !important; }
+    [data-theme="light"] .text-white:not(.rounded-full):not(.rounded-full *), [data-theme="light"] h1 { color: #111827 !important; }
+    [data-theme="light"] .rounded-full.text-white { color: #ffffff !important; }
+    [data-theme="light"] .text-neutral-200, [data-theme="light"] .text-neutral-300, [data-theme="light"] #coach-content { color: #374151 !important; }
+    [data-theme="light"] .text-neutral-400, [data-theme="light"] .text-neutral-500, [data-theme="light"] .text-neutral-600 { color: #5b6578 !important; }
+    [data-theme="light"] .text-neutral-100 { color: #1f2937 !important; }
+    [data-theme="light"] .border-neutral-800, [data-theme="light"] .border-neutral-900,
+    [data-theme="light"] .border-neutral-700\/50, [data-theme="light"] .border-neutral-700\/80,
+    [data-theme="light"] .border-neutral-800\/40, [data-theme="light"] .border-neutral-800\/80 { border-color: #c9d0dc !important; }
+    [data-theme="light"] .tab-btn.active, [data-theme="light"] .tab-btn[data-active="true"] { background: #fff !important; color: #111827 !important; box-shadow: 0 1px 4px rgba(0,0,0,0.08) !important; }
+    [data-theme="light"] #board { border-color: #9ca3af !important; box-shadow: 0 4px 20px rgba(0,0,0,0.1) !important; }
+    [data-theme="light"] .bg-emerald-950\/40, [data-theme="light"] .bg-emerald-950\/30, [data-theme="light"] .bg-emerald-950\/35 { background: rgba(16,185,129,0.12) !important; }
+    [data-theme="light"] .bg-blue-950\/15 { background: rgba(59,130,246,0.08) !important; }
+    [data-theme="light"] .bg-neutral-900\/20, [data-theme="light"] .bg-neutral-900\/40, [data-theme="light"] .bg-neutral-800\/35,
+    [data-theme="light"] .hover\:bg-neutral-800\/35:hover, [data-theme="light"] .hover\:bg-neutral-800\/30:hover { background: #e4e8f0 !important; }
+    [data-theme="light"] #eval-bar-text { color: #374151 !important; }
+    [data-theme="light"] .text-emerald-400 { color: #059669 !important; }
+    [data-theme="light"] .text-blue-400 { color: #2563eb !important; }
+    [data-theme="light"] .bg-black { background: #d1d5db !important; }
+    [data-theme="light"] #eval-bar-black { background: #6b7280 !important; }
+    [data-theme="light"] .shadow-\[inset_0_2px_6px_rgba\(0\,0\,0\,0\.7\)\] { box-shadow: inset 0 2px 4px rgba(0,0,0,0.15) !important; }
+    [data-theme="light"] .shadow-\[0_8px_30px_rgba\(0\,0\,0\,0\.5\)\] { box-shadow: 0 4px 20px rgba(0,0,0,0.1) !important; }
+    [data-theme="light"] .shadow-inner { box-shadow: inset 0 1px 3px rgba(0,0,0,0.12) !important; background: #c9d0dc !important; }
+    [data-theme="light"] .hover\:text-white:hover { color: #111827 !important; }
+    [data-theme="light"] .bg-neutral-900 { background: #d1d5db !important; border-color: #9ca3af !important; }
+    [data-theme="light"] .bg-neutral-900 .text-neutral-400, [data-theme="light"] .bg-neutral-900.text-neutral-400 { color: #4b5563 !important; }
+    [data-theme="light"] .bg-amber-950\/40 { background: rgba(217,165,32,0.15) !important; }
+    [data-theme="light"] .bg-red-950\/40 { background: rgba(220,38,38,0.12) !important; }
+    [data-theme="light"] .text-amber-400 { color: #b45309 !important; }
+    [data-theme="light"] .text-red-400 { color: #dc2626 !important; }
+    #theme-btn:hover i { transform: rotate(30deg); }
   </style>
 </head>
 <body class="bg-[#0b0b0d] bg-[radial-gradient(ellipse_at_center,_var(--tw-gradient-stops))] from-[#141418] via-[#0b0b0d] to-[#060608] text-neutral-200 min-h-screen flex flex-col items-center p-4 sm:p-6 font-sans select-none antialiased justify-center">
@@ -629,11 +690,14 @@ HTML = r"""
           </div>
         </div>
         <div class="flex items-center justify-between w-full border-t border-neutral-800/40 pt-2.5">
-          <div id="opening-badge" class="px-3 py-1.5 rounded-xl bg-[#1c1c21] border border-neutral-800 text-xs font-semibold text-neutral-300 flex items-center gap-1.5 truncate max-w-[240px] sm:max-w-[280px]" title="Opening">
+          <div id="opening-badge" class="px-3 py-1.5 rounded-xl bg-[#1c1c21] border border-neutral-800 text-xs font-semibold text-neutral-300 flex items-center gap-1.5 truncate max-w-[320px] sm:max-w-[360px]" title="Opening">
             <i data-lucide="book-open" class="w-3.5 h-3.5 text-emerald-400 shrink-0"></i>
             <span id="opening-name" class="truncate">Starting Position</span>
           </div>
           <div class="flex items-center gap-2">
+            <button id="theme-btn" onclick="toggleTheme()" class="p-2 py-1.5 rounded-xl bg-[#202226] border border-neutral-800 hover:bg-[#282a2f] text-neutral-300 hover:text-white transition-all select-none flex items-center justify-center hover:scale-105 w-9 h-9" title="Toggle light/dark theme">
+              <i id="theme-icon" data-lucide="moon" class="w-4 h-4 text-emerald-400"></i>
+            </button>
             <button id="mute-btn" onclick="toggleMute()" class="p-2 py-1.5 rounded-xl bg-[#202226] border border-neutral-800 hover:bg-[#282a2f] text-neutral-300 hover:text-white transition-all select-none flex items-center justify-center hover:scale-105 w-9 h-9" title="Mute sounds">
               <i id="mute-icon" data-lucide="volume-2" class="w-4 h-4 text-emerald-400"></i>
             </button>
@@ -645,7 +709,7 @@ HTML = r"""
         </div>
       </header>
       
-      <div class="flex gap-3 sm:gap-5 items-stretch justify-center w-full z-10">
+      <div class="flex gap-3 sm:gap-5 items-stretch justify-center w-full z-10 pb-4">
         <div class="relative w-8 sm:w-10 shrink-0">
           <div class="relative w-full h-full bg-black border border-neutral-800 rounded-lg overflow-hidden flex flex-col shadow-[inset_0_2px_6px_rgba(0,0,0,0.7)]">
             <div id="eval-bar-black" class="w-full bg-gradient-to-b from-[#3a3a3a] via-[#1a1a1a] to-[#050505] transition-[height] duration-500 ease-out" style="height:50%"></div>
@@ -657,7 +721,7 @@ HTML = r"""
         </div>
         <div class="relative flex-1 min-w-0 aspect-square">
           <div id="external-ranks" class="absolute -left-3 sm:-left-4 top-0 bottom-0 flex flex-col justify-between text-center text-[9px] sm:text-[11px] font-black text-neutral-500 w-3 py-[6.25%] z-10 opacity-80"></div>
-          <div id="external-files" class="absolute -bottom-3 sm:-bottom-4 left-0 right-0 flex justify-between text-center text-[9px] sm:text-[11px] font-black text-neutral-500 h-3 px-[6.25%] z-10 opacity-80"></div>
+          <div id="external-files" class="absolute -bottom-5 sm:-bottom-6 left-0 right-0 flex justify-between text-center text-[9px] sm:text-[11px] font-black text-neutral-500 h-3 px-[6.25%] z-10 opacity-80"></div>
           <div id="board" class="chessground w-full h-full relative rounded-xl shadow-[0_8px_30px_rgba(0,0,0,0.5)] overflow-hidden border-2 border-neutral-800"></div>
         </div>
       </div>
@@ -1749,7 +1813,7 @@ HTML = r"""
     $('tab-bar').innerHTML = TABS.map(t => `<button class="${tabClass(t.active)}" data-tab="${t.id}" onclick="switchTab('${t.id}')">${t.label}</button>`).join('');
     $('kbd-help').innerHTML = SHORTCUTS.map(([k,v]) => `<div class="flex justify-between items-center border-b border-neutral-800/20 pb-1.5"><span class="kbd">${k}</span><span class="text-[10px]">${v}</span></div>`).join('');
 
-    Object.assign(window, {navigate, toggleBoardOrientation, confirmReset, switchTab, loadCustomFen, copyCurrentFen, copyCurrentPgn, importPgn, selectMetric, toggleWppDropdown, toggleSingleWppPath, toggleAllManeuvers, toggleAnalysisColumn, toggleMute});
+    Object.assign(window, {navigate, toggleBoardOrientation, confirmReset, switchTab, loadCustomFen, copyCurrentFen, copyCurrentPgn, importPgn, selectMetric, toggleWppDropdown, toggleSingleWppPath, toggleAllManeuvers, toggleAnalysisColumn, toggleMute, toggleTheme});
 
     const keyActions = {
       arrowleft:()=>navigate('back'), pageup:()=>navigate('back'), backspace:()=>navigate('back'),
@@ -1847,7 +1911,30 @@ HTML = r"""
 
     $('board').addEventListener('mouseleave', hideTooltip);
 
-    reset(); chess = new Chess(); initBoard(); updateBoard(); lucide.createIcons(); audio.init();
+    /* ── Theme Toggle ──────────────────────────────────── */
+    function toggleTheme() {
+      const html = document.documentElement;
+      const isLight = html.getAttribute('data-theme') === 'light';
+      const newTheme = isLight ? 'dark' : 'light';
+      html.setAttribute('data-theme', newTheme);
+      localStorage.setItem('chess-ai-theme', newTheme);
+      updateThemeIcon(newTheme);
+    }
+
+    function updateThemeIcon(theme) {
+      const icon = $('theme-icon');
+      if (!icon) return;
+      icon.setAttribute('data-lucide', theme === 'light' ? 'sun' : 'moon');
+      lucide.createIcons();
+    }
+
+    function initTheme() {
+      const saved = localStorage.getItem('chess-ai-theme') || 'dark';
+      document.documentElement.setAttribute('data-theme', saved);
+      updateThemeIcon(saved);
+    }
+
+    reset(); chess = new Chess(); initBoard(); updateBoard(); lucide.createIcons(); audio.init(); initTheme();
   </script>
 </body>
 </html>
