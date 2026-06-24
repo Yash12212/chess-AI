@@ -249,13 +249,11 @@ def evaluate_and_calculate_pci(board: chess.Board):
         o = board.outcome()
         winner = o.winner if o is not None else None
         ev = 0 if winner is None else ("M+0" if winner == chess.WHITE else "M-0")
-        return ev, 0, "Maneuvering", None
+        return ev, 0, "Quiet", None
 
-    # Retrieve current player color & null move threat
     opp_color = "Black" if board.turn == chess.WHITE else "White"
     threat = _null_move_threat(board, opp_color, "threatens", require_minor_pieces=True)
 
-    # 1. Calculate Tactical Density (Max 50%)
     check_score = 20.0 if board.is_check() else 0.0
     threat_score = 20.0 if threat is not None else 0.0
     
@@ -266,15 +264,13 @@ def evaluate_and_calculate_pci(board: chess.Board):
     
     tactical_density = min(check_score + threat_score + hanging_score, 50.0)
 
-    # 2. Run Multi-PV=3 search to get scores for Urgency
     with eng.lock:
         r = eng.get().analyse(board, chess.engine.Limit(time=SF_MULTIPV_TIME, depth=SF_MULTIPV_DEPTH), multipv=3)
         r = r if isinstance(r, list) else [r]
 
     if not r:
-        return 0, 0, "Maneuvering", threat
+        return 0, 0, "Quiet", threat
 
-    # Parse primary evaluation score from the first candidate
     primary_score = r[0].get("score")
     if not primary_score:
         ev = 0
@@ -284,7 +280,6 @@ def evaluate_and_calculate_pci(board: chess.Board):
     else:
         ev = v if (v := primary_score.white().score()) is not None else 0
 
-    # Calculate standard deviation on raw centipawns
     scores = []
     has_mate = False
     for entry in r:
@@ -295,7 +290,6 @@ def evaluate_and_calculate_pci(board: chess.Board):
             has_mate = True
         scores.append(_get_safe_cp_value(score_obj))
 
-    # 3. Calculate Urgency Score (Max 50%)
     if has_mate:
         urgency_score = 50.0
     elif len(scores) < 2:
@@ -304,13 +298,11 @@ def evaluate_and_calculate_pci(board: chess.Board):
         stdev = calculate_stdev(scores)
         urgency_score = min((stdev / 100.0) * 50.0, 50.0)
 
-    # Combine into PCI
     pci_score = round(urgency_score + tactical_density)
     pci_score = max(0, min(100, pci_score))
 
-    # Determine tier
     if pci_score <= 25:
-        pci_tier = "Maneuvering"
+        pci_tier = "Quiet"
     elif pci_score <= 50:
         pci_tier = "Strategic"
     elif pci_score <= 75:
@@ -491,39 +483,31 @@ def build_coach_prompts(ctx):
         raw = ev.replace("+", "").replace("-", "").strip()
         return "" if (raw and raw in ev_desc) else f" with an evaluation of {ev}"
 
+    sys_first = sys_second = ""
     if ctx.get("is_checkmate"):
         sys_first = "State that checkmate has been delivered."
         sys_second = "Confirm that this concludes the game."
-        instr = (f"1. State that {p} delivered checkmate with {m}.\n"
-                 f"2. Confirm that this concludes the game.")
+        instr = f"1. State that {p} delivered checkmate with {m}.\n2. Confirm that this concludes the game."
     elif ctx.get("is_forced_mate") and not ctx["is_bad_move"]:
         sys_first = "Explain the forced checkmate sequence setup."
         sys_second = "Note the forced checkmate valuation."
-        instr = (f"1. State that {p} played {m} to set up a forced mate.\n"
-                 f"2. Note that the evaluation is a forced checkmate ({ev}).")
+        instr = f"1. State that {p} played {m} to set up a forced mate.\n2. Note that the evaluation is a forced checkmate ({ev})."
     elif ctx["is_bad_move"]:
         sys_first = "Explain why the move is bad using the provided evaluation."
         sys_second = "State the refutation sequence exactly as provided."
         phrase = {"inaccuracy": "an inaccuracy", "mistake": "a mistake"}.get(cls, "a blunder")
         lead = f"1. Explain that {p} played {m}, which is {phrase} because it {ev_desc}{ev_phrase()}.\n"
-        if any(k in feats for k in ["- Opponent Refutation:", "- Threat Created:"]):
-            instr = lead + f"2. Conclude by writing: The refutation is exactly: {ref}."
-        else:
-            instr = lead + f"2. State that '{best}' was the best alternative."
+        instr = lead + (f"2. Conclude by writing: The refutation is exactly: {ref}." if ref else f"2. State that '{best}' was the best alternative.")
     else:
         sys_first = "Explain the move's purpose."
         sys_second = "State the evaluation or immediate tactical benefit."
-        if any(k in feats for k in ["- Fork:", "- Rook:"]):
-            instr = (f"1. Explain that {p} played {m} to {purpose}.\n"
-                     f"2. Describe the benefit of {m} using the Fork or Rook details.")
+        if ctx["benefit_detail"]:
+            instr = f"1. Explain that {p} played {m} to {purpose}.\n2. Describe the benefit of {m} using the Fork or Rook details from the provided JSON."
         else:
-            instr = (f"1. Explain that {p} played {m} to {purpose}.\n"
-                     f"2. State that this move {ev_desc}{ev_phrase()}.")
+            instr = f"1. Explain that {p} played {m} to {purpose}.\n2. State that this move {ev_desc}{ev_phrase()}."
 
     system_prompt = f"{SYS_INTRO} First sentence: {sys_first} Second sentence: {sys_second} {SYS_OUTRO}"
-    user_prompt = (f"Data:\n{feats}\n{ctx['eval_context']}\n\n"
-                   f"Instructions:\n{instr}\n\n"
-                   f"Rule: Write exactly two sentences. Never repeat the evaluation or its description. No meta-text.")
+    user_prompt = f"Data:\n{feats}\n{ctx['eval_context']}\n\nInstructions:\n{instr}\n\nRule: Write exactly two sentences. Never repeat the evaluation or its description. No meta-text."
     return system_prompt, user_prompt
 
 
@@ -595,160 +579,116 @@ HTML = r"""
 <head>
   <meta charset="UTF-8">
   <meta name="viewport" content="width=device-width, initial-scale=1.0">
-  <meta name="description" content="Chess Analysis Hub - Analyze your chess games, evaluate positions with Stockfish, track positional balance, and get AI coach insights.">
+  <meta name="description" content="Chess Analysis Hub - Analyze your chess games, evaluate positions with Stockfish, track position types, and get AI coach insights.">
   <title>Chess Analysis Hub</title>
   <link rel="stylesheet" href="https://cdn.jsdelivr.net/npm/@lichess-org/chessground@10.1.1/assets/chessground.base.css">
   <link rel="stylesheet" href="https://cdn.jsdelivr.net/npm/@lichess-org/chessground@10.1.1/assets/chessground.brown.css">
   <link rel="stylesheet" href="https://cdn.jsdelivr.net/npm/@lichess-org/chessground@10.1.1/assets/chessground.cburnett.css">
+  <link rel="preconnect" href="https://fonts.googleapis.com">
+  <link rel="preconnect" href="https://fonts.gstatic.com" crossorigin>
+  <link href="https://fonts.googleapis.com/css2?family=Outfit:wght@300;400;500;600;700;800;900&family=JetBrains+Mono:wght@400;500;700;800&display=swap" rel="stylesheet">
   <script src="https://cdn.tailwindcss.com"></script>
   <style type="text/tailwindcss">
     @layer components {
-      .card   { @apply bg-[#1d1d21] border border-neutral-700 rounded-2xl; }
-      .panel  { @apply bg-[#131316]/80 border border-neutral-700 rounded-xl shadow-inner; }
-      .btn    { @apply flex items-center justify-center gap-1.5 bg-[#2b2d31] border border-neutral-700 py-2.5 rounded-lg transition active:translate-y-0.5 text-neutral-300 hover:bg-[#35373c] hover:text-white; }
-      .btn-em { @apply bg-emerald-950/20 border-emerald-500/30 text-emerald-400 hover:bg-emerald-900/40 hover:text-emerald-300; }
+      .card   { @apply bg-[#151519]/80 backdrop-blur-md border border-neutral-800/80 rounded-2xl shadow-xl transition-all duration-300; }
+      .panel  { @apply bg-[#0c0c0e]/90 border border-neutral-900/90 rounded-xl shadow-inner; }
+      .btn    { @apply flex items-center justify-center gap-1.5 bg-[#202226] border border-neutral-800/60 py-2.5 rounded-lg transition active:translate-y-0.5 text-neutral-300 hover:bg-[#282a2f] hover:text-white; }
+      .btn-em { @apply bg-emerald-950/30 border-emerald-500/40 text-emerald-400 hover:bg-emerald-900/50 hover:text-emerald-300; }
       .btn-red{ @apply text-red-400 hover:bg-red-950/40 hover:text-red-300; }
-      .input  { @apply w-full bg-[#1c1c21] border border-neutral-700/60 text-neutral-100 text-xs px-3 py-2.5 rounded-lg focus:outline-none focus:ring-1 focus:ring-emerald-500/50 font-mono; }
-      .kbd    { @apply bg-[#2b2d31] px-1.5 py-0.5 rounded text-neutral-300 text-[10px] font-mono; }
+      .input  { @apply w-full bg-[#111113] border border-neutral-800/60 text-neutral-100 text-xs px-3 py-2.5 rounded-lg focus:outline-none focus:ring-1 focus:ring-emerald-500/50 font-mono; }
+      .kbd    { @apply bg-[#202226] px-1.5 py-0.5 rounded text-neutral-300 text-[10px] font-mono; }
     }
   </style>
   <style>
+    * {
+      font-family: 'Outfit', sans-serif;
+    }
+    .font-mono {
+      font-family: 'JetBrains Mono', monospace !important;
+    }
     ::-webkit-scrollbar{width:6px;height:6px}
-    ::-webkit-scrollbar-track{background:#131316}
-    ::-webkit-scrollbar-thumb{background:#3f3f46;border-radius:99px}
-    ::-webkit-scrollbar-thumb:hover{background:#52525b}
+    ::-webkit-scrollbar-track{background:#0c0c0e}
+    ::-webkit-scrollbar-thumb{background:#2a2a2e;border-radius:99px}
+    ::-webkit-scrollbar-thumb:hover{background:#3a3a3e}
     #board .last-move{background:var(--last-move-bg, rgba(255,255,255,0.12))!important}
   </style>
 </head>
-<body class="bg-[#0f0f11] bg-[radial-gradient(ellipse_at_center,_var(--tw-gradient-stops))] from-[#18181c] via-[#0f0f11] to-[#0a0a0c] text-neutral-200 min-h-screen flex flex-col items-center p-4 sm:p-6 font-sans select-none antialiased justify-center">
-  <div class="w-full max-w-[336px] min-[375px]:max-w-[376px] sm:max-w-[460px] md:max-w-[500px] lg:max-w-[1104px] xl:max-w-[1168px] 2xl:max-w-[1224px] flex flex-col gap-6 mx-auto my-auto">
-    <div class="flex flex-col lg:flex-row gap-6 w-full items-stretch justify-center">
-      <div class="flex flex-col gap-4 items-center shrink-0 lg:sticky lg:top-6 lg:self-start z-30">
-        <header class="relative z-30 w-full bg-[#1d1d21]/80 backdrop-blur-md border border-neutral-700/80 p-4 rounded-2xl shadow-md">
-          <div class="flex items-center justify-between w-full flex-wrap gap-3">
-            <div class="flex items-center gap-3">
-              <div class="p-2 rounded-xl bg-emerald-950/40 border border-emerald-500/30 text-emerald-400"><i data-lucide="crown" class="w-5 h-5"></i></div>
-              <h1 class="text-base sm:text-lg font-extrabold text-white tracking-tight">Chess AI</h1>
-            </div>
-            <div class="flex items-center gap-2">
-              <div id="turn-indicator" class="px-3 py-1.5 rounded-xl bg-[#2b2d31] border border-neutral-700 text-xs font-black uppercase tracking-wider text-neutral-300">
-                White to move
-              </div>
-              <div class="relative inline-block text-left">
-                <div id="wpp-badge" onclick="toggleWppDropdown()" class="hidden px-3 py-1.5 rounded-xl bg-blue-950/40 border border-blue-500/30 text-blue-400 text-xs font-black uppercase tracking-wider cursor-pointer hover:bg-blue-900/40 transition-all select-none flex items-center gap-1.5 hover:scale-105">
-                  <i data-lucide="crosshair" class="w-3.5 h-3.5"></i>
-                  <span id="wpp-badge-text">Worst Pieces</span>
-                  <i data-lucide="chevron-down" class="w-3.5 h-3.5 ml-0.5"></i>
-                </div>
-                <div id="wpp-dropdown" class="hidden absolute right-0 mt-2 w-72 bg-[#1c1c21]/95 backdrop-blur-md border border-neutral-700/80 rounded-xl shadow-2xl z-50 p-3 flex flex-col gap-2 transition-all">
-                  <div class="text-[10px] font-black uppercase tracking-wider text-neutral-400 border-b border-neutral-800 pb-1.5 mb-1 flex items-center justify-between">
-                    <span>Worst-Placed Pieces</span>
-                    <span class="text-neutral-500 font-normal">Select to show paths</span>
-                  </div>
-                  <div id="wpp-list" class="flex flex-col gap-1.5 max-h-64 overflow-y-auto pr-1">
-                  </div>
-                </div>
-              </div>
-            </div>
+<body class="bg-[#0b0b0d] bg-[radial-gradient(ellipse_at_center,_var(--tw-gradient-stops))] from-[#141418] via-[#0b0b0d] to-[#060608] text-neutral-200 min-h-screen flex flex-col items-center p-4 sm:p-6 font-sans select-none antialiased justify-center">
+  <div id="main-grid" class="w-full max-w-[1180px] mx-auto grid grid-cols-1 lg:grid-cols-[540px_1fr] gap-6 items-start justify-center">
+    
+    <!-- LEFT COLUMN: BOARD AND CONTROLS -->
+    <div class="flex flex-col gap-4 items-center w-full max-w-[540px] lg:sticky lg:top-6 lg:self-start z-20">
+      <header class="relative z-40 w-full bg-[#151519]/90 backdrop-blur-md border border-neutral-800/80 px-4 py-3 rounded-2xl shadow-md flex flex-col gap-2.5">
+        <div class="flex items-center justify-between w-full">
+          <div class="flex items-center gap-3">
+            <div class="p-2 rounded-xl bg-emerald-950/40 border border-emerald-500/30 text-emerald-400"><i data-lucide="crown" class="w-5 h-5"></i></div>
+            <h1 class="text-base sm:text-lg font-extrabold text-white tracking-tight">Chess AI</h1>
           </div>
-        </header>
-        <div class="flex gap-5 items-stretch justify-center w-full mb-2">
-          <div class="relative w-9 sm:w-10 shrink-0">
-            <div class="relative w-full h-full bg-black border border-neutral-700/80 rounded-lg overflow-hidden flex flex-col shadow-[inset_0_2px_6px_rgba(0,0,0,0.7)]">
-              <div id="eval-bar-black" class="w-full bg-gradient-to-b from-[#404040] via-[#1f1f1f] to-[#0a0a0a] transition-[height] duration-500 ease-out" style="height:50%"></div>
-              <div class="w-full bg-gradient-to-b from-neutral-50 via-neutral-100 to-neutral-200 flex-1"></div>
-              <div id="eval-bar-text-container" class="absolute left-1/2 transition-all duration-500 ease-out pointer-events-none z-10" style="top:50%">
-                <span id="eval-bar-text" class="block text-[11px] sm:text-xs font-black font-mono leading-none whitespace-nowrap transition-opacity duration-300">0.0</span>
-              </div>
-            </div>
-          </div>
-          <div class="relative w-[280px] h-[280px] min-[375px]:w-[320px] min-[375px]:h-[320px] sm:w-[400px] sm:h-[400px] md:w-[440px] md:h-[440px] lg:w-[480px] lg:h-[480px] xl:w-[512px] xl:h-[512px] 2xl:w-[540px] 2xl:h-[540px] shrink-0">
-            <div id="external-ranks" class="absolute -left-4 top-0 bottom-0 flex flex-col justify-between text-center text-[10px] sm:text-[11px] font-black text-neutral-500 w-3 py-[6.25%] z-10 opacity-80"></div>
-            <div id="external-files" class="absolute -bottom-4 left-0 right-0 flex justify-between text-center text-[10px] sm:text-[11px] font-black text-neutral-500 h-3 px-[6.25%] z-10 opacity-80"></div>
-            <div id="board" class="chessground w-full h-full relative rounded-xl shadow-[0_8px_30px_rgba(0,0,0,0.5)] overflow-hidden border-2 border-neutral-700"></div>
+          <div id="turn-indicator" class="px-3 py-1.5 rounded-xl bg-[#202226] border border-neutral-800 text-xs font-black uppercase tracking-wider text-neutral-300">
+            White to move
           </div>
         </div>
-        <div class="flex justify-between items-center gap-2 w-full p-2 card shadow-md">
-          <div class="flex gap-2 flex-1">
-            <button onclick="navigate('start')" class="btn flex-1 hover:bg-emerald-950/20 hover:text-emerald-400 group"><i data-lucide="chevrons-left" class="w-5 h-5 transition group-hover:-translate-x-1 duration-200"></i></button>
-            <button onclick="navigate('back')" class="btn flex-1 hover:bg-emerald-950/20 hover:text-emerald-400 group"><i data-lucide="chevron-left" class="w-5 h-5 transition group-hover:-translate-x-0.5 duration-200"></i></button>
-            <button onclick="navigate('forward')" class="btn flex-1 hover:bg-emerald-950/20 hover:text-emerald-400 group"><i data-lucide="chevron-right" class="w-5 h-5 transition group-hover:translate-x-0.5 duration-200"></i></button>
-            <button onclick="navigate('end')" class="btn flex-1 hover:bg-emerald-950/20 hover:text-emerald-400 group"><i data-lucide="chevrons-right" class="w-5 h-5 transition group-hover:translate-x-1 duration-200"></i></button>
+        <div class="flex items-center justify-between w-full border-t border-neutral-800/40 pt-2.5">
+          <div id="opening-badge" class="px-3 py-1.5 rounded-xl bg-[#1c1c21] border border-neutral-800 text-xs font-semibold text-neutral-300 flex items-center gap-1.5 truncate max-w-[240px] sm:max-w-[280px]" title="Opening">
+            <i data-lucide="book-open" class="w-3.5 h-3.5 text-emerald-400 shrink-0"></i>
+            <span id="opening-name" class="truncate">Starting Position</span>
           </div>
-          <div class="flex gap-2 shrink-0 ml-2">
-            <button onclick="toggleBoardOrientation()" class="btn btn-em px-2 sm:px-4 group"><i data-lucide="refresh-cw" class="w-5 h-5 transition group-hover:rotate-180 duration-300"></i></button>
-            <button onclick="confirmReset()" class="btn btn-red px-2 sm:px-4 group"><i data-lucide="trash-2" class="w-5 h-5 transition group-hover:scale-110 duration-200"></i></button>
+          <div class="flex items-center gap-2">
+            <button id="mute-btn" onclick="toggleMute()" class="p-2 py-1.5 rounded-xl bg-[#202226] border border-neutral-800 hover:bg-[#282a2f] text-neutral-300 hover:text-white transition-all select-none flex items-center justify-center hover:scale-105 w-9 h-9" title="Mute sounds">
+              <i id="mute-icon" data-lucide="volume-2" class="w-4 h-4 text-emerald-400"></i>
+            </button>
+            <button id="toggle-analysis-btn" onclick="toggleAnalysisColumn()" class="px-3 py-1.5 rounded-xl bg-[#202226] border border-neutral-800 hover:bg-[#282a2f] text-neutral-300 hover:text-white transition-all select-none flex items-center gap-1.5 hover:scale-105" title="Toggle metrics panel">
+              <i data-lucide="bar-chart-2" class="w-4 h-4 text-emerald-400"></i>
+              <span>Metrics</span>
+            </button>
           </div>
         </div>
-        <!-- Positional Balance Panel -->
-        <div class="w-full p-4 card shadow-md">
-          <h3 class="text-xs font-extrabold uppercase tracking-wider text-neutral-300 mb-2 flex items-center justify-between select-none">
-            <span class="flex items-center gap-2">
-              <i data-lucide="bar-chart-2" class="w-4 h-4 text-emerald-400"></i> Positional Balance
-            </span>
-            <span id="position-complexity-badge" class="hidden px-2 py-0.5 rounded-full text-[10px] font-black uppercase tracking-wider transition-all duration-300"></span>
-          </h3>
-          <div class="space-y-1 select-none">
-            <!-- Metric: Space -->
-            <div id="space-row" onclick="selectMetric('space')" class="flex items-center justify-between gap-3 p-1.5 rounded-xl border border-transparent hover:bg-neutral-800/35 hover:border-neutral-700/30 transition-all cursor-pointer group">
-              <span class="text-neutral-400 text-[10px] sm:text-xs font-bold uppercase tracking-wider flex items-center gap-1 group-hover:text-white transition-colors shrink-0 w-24 sm:w-28">
-                Space <i data-lucide="info" class="w-3 h-3 text-neutral-500 opacity-60"></i>
-              </span>
-              <div class="relative h-1.5 flex-1 bg-[#131316] rounded-full overflow-hidden flex shadow-inner">
-                <div class="w-1/2 flex justify-end bg-transparent border-r border-neutral-800/40">
-                  <div id="space-bar-black" class="h-full bg-[#b33430] transition-all duration-300" style="width: 0%"></div>
-                </div>
-                <div class="w-1/2 bg-transparent">
-                  <div id="space-bar-white" class="h-full bg-[#429443] transition-all duration-300" style="width: 0%"></div>
-                </div>
-              </div>
-              <span id="space-val-text" class="text-neutral-400 font-mono text-xs w-10 text-right shrink-0">0.00</span>
-            </div>
-
-            <!-- Metric: King Safety -->
-            <div id="king_safety-row" onclick="selectMetric('king_safety')" class="flex items-center justify-between gap-3 p-1.5 rounded-xl border border-transparent hover:bg-neutral-800/35 hover:border-neutral-700/30 transition-all cursor-pointer group">
-              <span class="text-neutral-400 text-[10px] sm:text-xs font-bold uppercase tracking-wider flex items-center gap-1 group-hover:text-white transition-colors shrink-0 w-24 sm:w-28">
-                King Safety <i data-lucide="info" class="w-3 h-3 text-neutral-500 opacity-60"></i>
-              </span>
-              <div class="relative h-1.5 flex-1 bg-[#131316] rounded-full overflow-hidden flex shadow-inner">
-                <div class="w-1/2 flex justify-end bg-transparent border-r border-neutral-800/40">
-                  <div id="king-safety-bar-black" class="h-full bg-[#b33430] transition-all duration-300" style="width: 0%"></div>
-                </div>
-                <div class="w-1/2 bg-transparent">
-                  <div id="king-safety-bar-white" class="h-full bg-[#429443] transition-all duration-300" style="width: 0%"></div>
-                </div>
-              </div>
-              <span id="king-safety-val-text" class="text-neutral-400 font-mono text-xs w-10 text-right shrink-0">0.00</span>
-            </div>
-
-            <!-- Metric: Pawn Structure -->
-            <div id="structure-row" onclick="selectMetric('structure')" class="flex items-center justify-between gap-3 p-1.5 rounded-xl border border-transparent hover:bg-neutral-800/35 hover:border-neutral-700/30 transition-all cursor-pointer group">
-              <span class="text-neutral-400 text-[10px] sm:text-xs font-bold uppercase tracking-wider flex items-center gap-1 group-hover:text-white transition-colors shrink-0 w-24 sm:w-28">
-                Structure <i data-lucide="info" class="w-3 h-3 text-neutral-500 opacity-60"></i>
-              </span>
-              <div class="relative h-1.5 flex-1 bg-[#131316] rounded-full overflow-hidden flex shadow-inner">
-                <div class="w-1/2 flex justify-end bg-transparent border-r border-neutral-800/40">
-                  <div id="structure-bar-black" class="h-full bg-[#b33430] transition-all duration-300" style="width: 0%"></div>
-                </div>
-                <div class="w-1/2 bg-transparent">
-                  <div id="structure-bar-white" class="h-full bg-[#429443] transition-all duration-300" style="width: 0%"></div>
-                </div>
-              </div>
-              <span id="structure-val-text" class="text-neutral-400 font-mono text-xs w-10 text-right shrink-0">0.00</span>
+      </header>
+      
+      <div class="flex gap-3 sm:gap-5 items-stretch justify-center w-full z-10">
+        <div class="relative w-8 sm:w-10 shrink-0">
+          <div class="relative w-full h-full bg-black border border-neutral-800 rounded-lg overflow-hidden flex flex-col shadow-[inset_0_2px_6px_rgba(0,0,0,0.7)]">
+            <div id="eval-bar-black" class="w-full bg-gradient-to-b from-[#3a3a3a] via-[#1a1a1a] to-[#050505] transition-[height] duration-500 ease-out" style="height:50%"></div>
+            <div class="w-full bg-gradient-to-b from-neutral-100 via-neutral-200 to-neutral-300 flex-1"></div>
+            <div id="eval-bar-text-container" class="absolute left-1/2 transition-all duration-500 ease-out pointer-events-none z-10" style="top:50%">
+              <span id="eval-bar-text" class="block text-[10px] sm:text-xs font-black font-mono leading-none whitespace-nowrap transition-opacity duration-300">0.0</span>
             </div>
           </div>
+        </div>
+        <div class="relative flex-1 min-w-0 aspect-square">
+          <div id="external-ranks" class="absolute -left-3 sm:-left-4 top-0 bottom-0 flex flex-col justify-between text-center text-[9px] sm:text-[11px] font-black text-neutral-500 w-3 py-[6.25%] z-10 opacity-80"></div>
+          <div id="external-files" class="absolute -bottom-3 sm:-bottom-4 left-0 right-0 flex justify-between text-center text-[9px] sm:text-[11px] font-black text-neutral-500 h-3 px-[6.25%] z-10 opacity-80"></div>
+          <div id="board" class="chessground w-full h-full relative rounded-xl shadow-[0_8px_30px_rgba(0,0,0,0.5)] overflow-hidden border-2 border-neutral-800"></div>
         </div>
       </div>
-      <div class="w-full max-w-[336px] min-[375px]:max-w-[376px] sm:max-w-[460px] md:max-w-[500px] lg:max-w-[540px] xl:max-w-[572px] 2xl:max-w-[600px] lg:h-[652px] xl:h-[684px] 2xl:h-[712px] card flex flex-col min-h-[500px] lg:min-h-0 overflow-hidden shadow-2xl">
-        <div class="px-4 py-3 bg-[#131316] border-b border-neutral-700/80">
-          <div class="flex bg-[#2b2d31] p-1 rounded-xl border border-neutral-700 gap-1" id="tab-bar"></div>
+      
+      <div class="flex justify-between items-center gap-2 w-full p-2 card shadow-md">
+        <div class="flex gap-2 flex-1">
+          <button onclick="navigate('start')" class="btn flex-1 hover:bg-emerald-950/20 hover:text-emerald-400 group"><i data-lucide="chevrons-left" class="w-5 h-5 transition group-hover:-translate-x-1 duration-200"></i></button>
+          <button onclick="navigate('back')" class="btn flex-1 hover:bg-emerald-950/20 hover:text-emerald-400 group"><i data-lucide="chevron-left" class="w-5 h-5 transition group-hover:-translate-x-0.5 duration-200"></i></button>
+          <button onclick="navigate('forward')" class="btn flex-1 hover:bg-emerald-950/20 hover:text-emerald-400 group"><i data-lucide="chevron-right" class="w-5 h-5 transition group-hover:translate-x-0.5 duration-200"></i></button>
+          <button onclick="navigate('end')" class="btn flex-1 hover:bg-emerald-950/20 hover:text-emerald-400 group"><i data-lucide="chevrons-right" class="w-5 h-5 transition group-hover:translate-x-1 duration-200"></i></button>
+        </div>
+        <div class="flex gap-2 shrink-0 ml-2">
+          <button onclick="toggleBoardOrientation()" class="btn btn-em px-2 sm:px-4 group"><i data-lucide="refresh-cw" class="w-5 h-5 transition group-hover:rotate-180 duration-300"></i></button>
+          <button onclick="confirmReset()" class="btn btn-red px-2 sm:px-4 group"><i data-lucide="trash-2" class="w-5 h-5 transition group-hover:scale-110 duration-200"></i></button>
+        </div>
+      </div>
+    </div>
+    
+    <!-- RIGHT COLUMN: MOVES, COACH & ANALYSIS -->
+    <div class="w-full max-w-[540px] lg:max-w-[600px] lg:h-[691px] flex flex-col gap-4 lg:col-start-2 lg:row-start-1">
+      <!-- MOVES & COACH CARD -->
+      <div class="w-full card flex flex-col min-h-[350px] flex-1 overflow-hidden shadow-2xl">
+        <div class="px-4 py-3 bg-[#0c0c0e] border-b border-neutral-800/80">
+          <div class="flex bg-[#202226] p-1 rounded-xl border border-neutral-800 gap-1" id="tab-bar"></div>
         </div>
         <div id="game-tab" class="tab-content p-4 flex-1 flex flex-col overflow-hidden">
           <div class="flex-1 flex flex-col panel p-4 overflow-y-auto overscroll-contain" id="move-list"></div>
           
           <!-- LLM Coach Panel -->
-          <div class="panel p-4 mt-3 flex flex-col h-64 bg-[#17171a]/40 border border-neutral-700/80 shrink-0 shadow-inner" id="coach-panel">
-            <div class="flex items-center gap-2 mb-2 pb-2 border-b border-neutral-800 shrink-0">
+          <div class="panel p-4 mt-3 flex flex-col h-[180px] bg-[#0e0e11]/40 border border-neutral-800/80 shrink-0 shadow-inner" id="coach-panel">
+            <div class="flex items-center gap-2 mb-2 pb-2 border-b border-neutral-900 shrink-0">
               <i data-lucide="sparkles" class="w-4 h-4 text-emerald-400 animate-pulse"></i>
               <span class="text-xs font-extrabold uppercase tracking-wider text-neutral-300">AI Coach Insights</span>
               <div id="coach-loading" class="hidden ml-auto flex items-center gap-1 text-[10px] text-emerald-400 font-bold animate-pulse">
@@ -799,6 +739,69 @@ HTML = r"""
           <div id="io-status" class="mt-4 w-max max-w-full bg-emerald-500 text-[#0f0f11] text-[11px] font-extrabold px-3 py-1.5 rounded-full shadow-lg hidden text-center animate-pulse mx-auto"></div>
         </div>
       </div>
+      
+      <!-- COLLAPSIBLE ANALYSIS COLUMN -->
+      <div id="analysis-col" class="grid grid-cols-1 sm:grid-cols-2 gap-4 w-full shrink-0">
+        <div class="w-full px-3.5 py-2.5 card shadow-md">
+          <h3 class="text-[11px] font-black uppercase tracking-wider text-neutral-300 mb-2 flex items-center gap-2 select-none">
+            <i data-lucide="bar-chart-2" class="w-3.5 h-3.5 text-emerald-400 shrink-0"></i>
+            <span>Position Type</span>
+            <span id="position-complexity-badge" class="hidden px-1.5 py-0.5 rounded bg-[#202226] border border-neutral-800 text-[8px] font-bold uppercase tracking-wider text-neutral-400 transition-all duration-300 shrink-0 whitespace-nowrap"></span>
+          </h3>
+          <div class="space-y-2 select-none">
+            <div id="space-row" onclick="selectMetric('space')" class="flex items-center gap-2 py-1 px-2 rounded-xl border border-transparent hover:bg-neutral-800/35 hover:border-neutral-700/30 transition-all cursor-pointer group">
+              <span class="text-[10px] font-bold uppercase tracking-wider text-neutral-400 group-hover:text-white transition-colors shrink-0 w-20">Space</span>
+              <div class="relative h-1.5 flex-1 bg-[#0c0c0e] rounded-full overflow-hidden flex shadow-inner">
+                <div class="w-1/2 flex justify-end bg-transparent border-r border-neutral-900/40">
+                  <div id="space-bar-black" class="h-full bg-[#f43f5e] shadow-[0_0_8px_rgba(244,63,94,0.4)] transition-all duration-300" style="width: 0%"></div>
+                </div>
+                <div class="w-1/2 bg-transparent">
+                  <div id="space-bar-white" class="h-full bg-[#10b981] shadow-[0_0_8px_rgba(16,185,129,0.4)] transition-all duration-300" style="width: 0%"></div>
+                </div>
+              </div>
+              <span id="space-val-text" class="text-neutral-400 font-mono text-xs w-10 text-right shrink-0">0.00</span>
+            </div>
+            <div id="king_safety-row" onclick="selectMetric('king_safety')" class="flex items-center gap-2 py-1 px-2 rounded-xl border border-transparent hover:bg-neutral-800/35 hover:border-neutral-700/30 transition-all cursor-pointer group">
+              <span class="text-[10px] font-bold uppercase tracking-wider text-neutral-400 group-hover:text-white transition-colors shrink-0 w-20">King Safety</span>
+              <div class="relative h-1.5 flex-1 bg-[#0c0c0e] rounded-full overflow-hidden flex shadow-inner">
+                <div class="w-1/2 flex justify-end bg-transparent border-r border-neutral-900/40">
+                  <div id="king-safety-bar-black" class="h-full bg-[#f43f5e] shadow-[0_0_8px_rgba(244,63,94,0.4)] transition-all duration-300" style="width: 0%"></div>
+                </div>
+                <div class="w-1/2 bg-transparent">
+                  <div id="king-safety-bar-white" class="h-full bg-[#10b981] shadow-[0_0_8px_rgba(16,185,129,0.4)] transition-all duration-300" style="width: 0%"></div>
+                </div>
+              </div>
+              <span id="king-safety-val-text" class="text-neutral-400 font-mono text-xs w-10 text-right shrink-0">0.00</span>
+            </div>
+            <div id="structure-row" onclick="selectMetric('structure')" class="flex items-center gap-2 py-1 px-2 rounded-xl border border-transparent hover:bg-neutral-800/35 hover:border-neutral-700/30 transition-all cursor-pointer group">
+              <span class="text-[10px] font-bold uppercase tracking-wider text-neutral-400 group-hover:text-white transition-colors shrink-0 w-20">Structure</span>
+              <div class="relative h-1.5 flex-1 bg-[#0c0c0e] rounded-full overflow-hidden flex shadow-inner">
+                <div class="w-1/2 flex justify-end bg-transparent border-r border-neutral-900/40">
+                  <div id="structure-bar-black" class="h-full bg-[#f43f5e] shadow-[0_0_8px_rgba(244,63,94,0.4)] transition-all duration-300" style="width: 0%"></div>
+                </div>
+                <div class="w-1/2 bg-transparent">
+                  <div id="structure-bar-white" class="h-full bg-[#10b981] shadow-[0_0_8px_rgba(16,185,129,0.4)] transition-all duration-300" style="width: 0%"></div>
+                </div>
+              </div>
+              <span id="structure-val-text" class="text-neutral-400 font-mono text-xs w-10 text-right shrink-0">0.00</span>
+            </div>
+          </div>
+        </div>
+        
+        <div class="w-full px-3.5 py-2.5 card shadow-md flex flex-col gap-2" id="wpp-card">
+          <h3 class="text-[11px] font-black uppercase tracking-wider text-neutral-300 flex flex-wrap items-center justify-between gap-1 select-none">
+            <span class="flex items-center gap-1.5">
+              <i data-lucide="crosshair" class="w-3.5 h-3.5 text-blue-400"></i> Worst Pieces
+            </span>
+            <button id="toggle-all-maneuvers-btn" onclick="toggleAllManeuvers()" class="px-2 py-0.5 rounded-md bg-[#202226] border border-neutral-800/80 text-[9px] font-bold uppercase tracking-wider text-neutral-300 hover:bg-[#282a2f] hover:text-white transition-all flex items-center gap-1 shrink-0" title="Show maneuvering ideas">
+              <i data-lucide="eye" class="w-3 h-3 text-blue-400"></i> Maneuvers
+            </button>
+          </h3>
+          <div id="wpp-list" class="flex flex-col gap-1.5 h-[110px] overflow-y-auto pr-1">
+            <div class="flex flex-col items-center justify-center h-full text-neutral-500 text-xs font-sans animate-pulse"><i data-lucide="loader-2" class="w-4 h-4 text-neutral-500 animate-spin mb-1"></i><span>Analyzing position...</span></div>
+          </div>
+        </div>
+      </div>
     </div>
   </div>
 
@@ -835,8 +838,140 @@ HTML = r"""
       ["F","Flip"],["R","Reset"],["M","Moves"],["S","Stats"],["I","Import/Export"],["C","Copy FEN"],["P","Copy PGN"]];
 
     let states, currentIndex, chess, ground;
+    let showAllManeuvers = false;
+    let analysisExpanded = true;
+    let activeTab = 'game';
     const $ = id => document.getElementById(id);
     const $$ = sel => document.querySelectorAll(sel);
+
+    const audio = {
+      ctx: null,
+      buffers: {},
+      urls: {
+        move: 'https://lichess1.org/assets/sound/standard/Move.mp3',
+        capture: 'https://lichess1.org/assets/sound/standard/Capture.mp3',
+        check: 'https://lichess1.org/assets/sound/standard/Check.mp3',
+        gameover: 'https://lichess1.org/assets/sound/standard/GenericNotify.mp3'
+      },
+      fetchPromises: {},
+
+      prefetch() {
+        for (const [key, url] of Object.entries(this.urls)) {
+          this.fetchPromises[key] = fetch(url)
+            .then(r => {
+              if (!r.ok) throw new Error(r.statusText);
+              return r.arrayBuffer();
+            })
+            .catch(e => {
+              console.warn(`Failed to prefetch audio for ${key}:`, e);
+              return null;
+            });
+        }
+      },
+
+      init() {
+        if (!this.ctx) {
+          try {
+            this.ctx = new (window.AudioContext || window.webkitAudioContext)({ latencyHint: 'interactive' });
+            this.decodeAll();
+          } catch (e) {
+            console.error("Failed to initialize AudioContext:", e);
+          }
+        }
+        if (this.ctx && this.ctx.state === 'suspended') {
+          this.ctx.resume().catch(() => {});
+        }
+      },
+
+      async decodeAll() {
+        for (const [key, promise] of Object.entries(this.fetchPromises)) {
+          try {
+            const arrayBuffer = await promise;
+            if (arrayBuffer && !this.buffers[key]) {
+              this.buffers[key] = await this.ctx.decodeAudioData(arrayBuffer.slice(0));
+            }
+          } catch (e) {
+            console.error(`Failed to decode audio for ${key}:`, e);
+          }
+        }
+      },
+
+      playBuffer(key) {
+        this.init();
+        const buffer = this.buffers[key];
+        if (!buffer) {
+          // If buffer is not loaded yet (or fetch failed), fall back to standard HTML5 Audio
+          try {
+            const tempAudio = new Audio(this.urls[key]);
+            tempAudio.play().catch(() => {});
+          } catch {}
+          return;
+        }
+        try {
+          const source = this.ctx.createBufferSource();
+          source.buffer = buffer;
+          source.connect(this.ctx.destination);
+          source.start(0);
+        } catch (e) {
+          console.warn("Buffer play failed:", e);
+        }
+      },
+
+      playMove() { this.playBuffer('move'); },
+      playCapture() { this.playBuffer('capture'); },
+      playCheck() { this.playBuffer('check'); },
+      playGameOver() { this.playBuffer('gameover'); }
+    };
+
+    // Prefetch all audio files immediately on load
+    audio.prefetch();
+
+    // Auto-resume AudioContext on first user interaction for zero latency
+    const unlockAudio = () => {
+      audio.init();
+      ['click', 'mousedown', 'keydown', 'touchstart'].forEach(e => {
+        document.removeEventListener(e, unlockAudio);
+      });
+    };
+    ['click', 'mousedown', 'keydown', 'touchstart'].forEach(e => {
+      document.addEventListener(e, unlockAudio);
+    });
+
+    let isMuted = false;
+    const toggleMute = () => {
+      isMuted = !isMuted;
+      const icon = $('mute-icon');
+      const btn = $('mute-btn');
+      if (icon && btn) {
+        if (isMuted) {
+          icon.setAttribute('data-lucide', 'volume-x');
+          icon.className = 'w-4 h-4 text-neutral-500';
+          btn.title = 'Unmute sounds';
+        } else {
+          icon.setAttribute('data-lucide', 'volume-2');
+          icon.className = 'w-4 h-4 text-emerald-400';
+          btn.title = 'Mute sounds';
+        }
+        lucide.createIcons();
+      }
+    };
+
+    const playSoundForMove = (san) => {
+      if (isMuted || !san) return;
+      try {
+        if (san.includes('#')) {
+          audio.playGameOver();
+        } else if (san.includes('+')) {
+          audio.playCheck();
+        } else if (san.includes('x')) {
+          audio.playCapture();
+        } else {
+          audio.playMove();
+        }
+      } catch (e) {
+        console.error("Audio error:", e);
+      }
+    };
 
     const apiCall = async (url, body) => {
       const r = await fetch(url, {
@@ -863,13 +998,19 @@ HTML = r"""
         positional_balance: { space: 0.0, king_safety: 0.0, structure: 0.0 },
         positional_details: { space: [], king_safety: [], structure: [] },
         pci_score: 0,
-        pci_tier: "Maneuvering",
+        pci_tier: "Quiet",
         threat: null,
         worst_placed_piece: null
       })];
       currentIndex = 0;
       showWppPath = false;
+      showAllManeuvers = false;
       activeWppPaths.clear();
+      const btn = $('toggle-all-maneuvers-btn');
+      if (btn) {
+        btn.className = 'px-2 py-0.5 rounded-md bg-[#202226] border border-neutral-800/80 text-[9px] font-bold uppercase tracking-wider text-neutral-300 hover:bg-[#282a2f] hover:text-white transition-all flex items-center gap-1 shrink-0';
+        btn.innerHTML = `<i data-lucide="eye" class="w-3 h-3 text-blue-400"></i> Maneuvers`;
+      }
       const dropdown = $('wpp-dropdown');
       if (dropdown) dropdown.classList.add('hidden');
     };
@@ -914,7 +1055,11 @@ HTML = r"""
     const initBoard = () => {
       ground = Chessground($('board'), {
         fen: chess.fen(), orientation:'white', coordinates:false,
-        movable:{ color:'white', free:false, dests:getDests(chess), events:{ after:onUserMove } }
+        movable:{ color:'white', free:false, dests:getDests(chess), events:{ after:onUserMove } },
+        animation: {
+          enabled: true,
+          duration: 120 // Snappy transition speed
+        }
       });
       renderCoords();
     };
@@ -988,7 +1133,11 @@ HTML = r"""
     };
 
     const updateBoard = () => {
-      const cur = states[currentIndex]; chess.load(cur.fen);
+      const cur = states[currentIndex];
+      if (currentIndex > 0) {
+        playSoundForMove(cur.san);
+      }
+      chess.load(cur.fen);
       const act = chess.turn()==='w'?'white':'black';
       const lm = cur.move_uci ? [cur.move_uci.slice(0,2), cur.move_uci.slice(2,4)] : undefined;
       ground.set({ fen:cur.fen, lastMove:lm, turnColor:act, movable:{color:act, dests:getDests(chess)} });
@@ -1014,7 +1163,7 @@ HTML = r"""
       
       displayCoachInsight(cur);
       updatePositionalBalanceUI(cur.positional_balance, cur.pci_score, cur.pci_tier);
-      updateWppUI(cur.worst_placed_piece);
+      updateWppUI(cur.worst_placed_piece, (currentIndex > 0 && cur.worst_placed_piece === null));
 
       if (currentIndex > 0 && cur.classification === null) classifyMove(currentIndex);
       else if (cur.eval === null || cur.positional_balance === null) evalPosition(currentIndex);
@@ -1041,9 +1190,9 @@ HTML = r"""
           updateEvalMeter(s.eval);
           updateMarkings(s);
           updatePositionalBalanceUI(s.positional_balance, s.pci_score, s.pci_tier);
-          updateWppUI(s.worst_placed_piece);
+          updateWppUI(s.worst_placed_piece, (currentIndex > 0 && s.worst_placed_piece === null));
         }
-      } catch { if (currentIndex===i) { updateEvalMeter(0); updatePositionalBalanceUI(null, null, null); updateWppUI(null); } }
+      } catch { if (currentIndex===i) { updateEvalMeter(0); updatePositionalBalanceUI(null, null, null); updateWppUI(null, false); } }
       s.evalLoading = false;
     };
 
@@ -1061,7 +1210,7 @@ HTML = r"""
           pci_score: d.pci_score,
           pci_tier: d.pci_tier,
           threat: d.threat,
-          worst_placed_piece: d.worst_placed_piece}); // Saved WPP here
+          worst_placed_piece: d.worst_placed_piece});
         if (currentIndex===i) {
           updateEvalMeter(s.eval);
           if ($('opening-name')) $('opening-name').innerText = s.opening_name;
@@ -1069,7 +1218,7 @@ HTML = r"""
           displayCoachInsight(s);
           fetchCoachInsight(i);
           updatePositionalBalanceUI(s.positional_balance, s.pci_score, s.pci_tier);
-          updateWppUI(s.worst_placed_piece);
+          updateWppUI(s.worst_placed_piece, (currentIndex > 0 && s.worst_placed_piece === null));
         }
       } catch { Object.assign(s, {classification:'unknown', eval:0, move_accuracy:100}); }
       renderMoveList();
@@ -1185,7 +1334,6 @@ HTML = r"""
       const sh = [], to = s.move_uci?.slice(2,4);
       if (to && s.classification && !['loading','unknown'].includes(s.classification)) drawBadge(to, s.classification);
       
-      // Draw standard best-move indicator
       if (s.best_move && s.move_uci && s.classification) {
         if (!['best','brilliant','great','forced','book'].includes(s.classification) && s.best_move !== s.move_uci) {
           let bestMoveSan = s.best_move;
@@ -1200,82 +1348,35 @@ HTML = r"""
               });
               if (mv) bestMoveSan = mv.san;
             }
-          } catch (e) {
-            console.error(e);
-          }
-          sh.push({
-            orig: s.best_move.slice(0,2),
-            dest: s.best_move.slice(2,4),
-            brush: 'green',
-            modifiers: { lineWidth: 10 },
-            reason: `Best alternative move: ${bestMoveSan}`
-          });
+          } catch (e) { console.error(e); }
+          sh.push({ orig: s.best_move.slice(0,2), dest: s.best_move.slice(2,4), brush: 'green', modifiers: { lineWidth: 10 }, reason: `Best alternative move: ${bestMoveSan}` });
         }
       }
 
-      // Draw chess-detect annotations
       if (s.arrows) {
-        s.arrows.forEach(a => {
-          sh.push({
-            orig: a.orig,
-            dest: a.dest,
-            brush: a.brush,
-            modifiers: { lineWidth: 8 },
-            reason: a.reason
-          });
-        });
+        s.arrows.forEach(a => sh.push({ orig: a.orig, dest: a.dest, brush: a.brush, modifiers: { lineWidth: 8 }, reason: a.reason }));
       }
-
-      // Draw chess-detect highlight circles
       if (s.circles) {
-        s.circles.forEach(c => {
-          sh.push({
-            orig: c.orig,
-            brush: c.brush,
-            reason: c.reason
-          });
-        });
+        s.circles.forEach(c => sh.push({ orig: c.orig, brush: c.brush, reason: c.reason }));
       }
 
-      // Draw selected positional metric highlights
       if (selectedMetric && s.positional_details && s.positional_details[selectedMetric]) {
-        s.positional_details[selectedMetric].forEach(h => {
-          sh.push({
-            orig: h.orig,
-            dest: h.dest,
-            brush: h.brush,
-            modifiers: h.modifiers || {},
-            reason: h.reason
-          });
-        });
+        s.positional_details[selectedMetric].forEach(h => sh.push({ orig: h.orig, dest: h.dest, brush: h.brush, modifiers: h.modifiers || {}, reason: h.reason }));
       }
 
-      // Draw WPP maneuver path arrows for active paths
       if (s.worst_placed_piece && s.worst_placed_piece.worst_pieces_list) {
         s.worst_placed_piece.worst_pieces_list.forEach(wpp => {
-          if (activeWppPaths.has(wpp.wpp_square) && wpp.maneuver_path && wpp.maneuver_path.length >= 2) {
+          if ((showAllManeuvers || activeWppPaths.has(wpp.wpp_square)) && wpp.maneuver_path && wpp.maneuver_path.length >= 2) {
             const path = wpp.maneuver_path;
             for (let i = 0; i < path.length - 1; i++) {
-              sh.push({
-                orig: path[i],
-                dest: path[i+1],
-                brush: 'blue',
-                modifiers: { lineWidth: 8 },
-                reason: `Maneuver path for worst-placed piece: ${wpp.wpp_name} (${path[i]} -> ${path[i+1]})`
-              });
+              sh.push({ orig: path[i], dest: path[i+1], brush: 'blue', modifiers: { lineWidth: 8 }, reason: `Maneuver path for worst-placed piece: ${wpp.wpp_name} (${path[i]} -> ${path[i+1]})` });
             }
           }
         });
-      } else if (showWppPath && s.worst_placed_piece && s.worst_placed_piece.maneuver_path && s.worst_placed_piece.maneuver_path.length >= 2) {
+      } else if ((showAllManeuvers || showWppPath) && s.worst_placed_piece && s.worst_placed_piece.maneuver_path && s.worst_placed_piece.maneuver_path.length >= 2) {
         const path = s.worst_placed_piece.maneuver_path;
         for (let i = 0; i < path.length - 1; i++) {
-          sh.push({
-            orig: path[i],
-            dest: path[i+1],
-            brush: 'blue',
-            modifiers: { lineWidth: 8 },
-            reason: `Maneuver path for worst-placed piece: ${s.worst_placed_piece.wpp_name} (${path[i]} -> ${path[i+1]})`
-          });
+          sh.push({ orig: path[i], dest: path[i+1], brush: 'blue', modifiers: { lineWidth: 8 }, reason: `Maneuver path for worst-placed piece: ${s.worst_placed_piece.wpp_name} (${path[i]} -> ${path[i+1]})` });
         }
       }
 
@@ -1286,7 +1387,7 @@ HTML = r"""
     const drawBadge = (key, cls) => {
       const o = ground.state.orientation === 'white';
       const col = o ? key.charCodeAt(0)-97 : 7-(key.charCodeAt(0)-97), row = o ? 8-parseInt(key[1]) : parseInt(key[1])-1;
-      const w = Object.assign(document.createElement('div'), {className:'classification-badge-wrapper absolute z-40'});
+      const w = Object.assign(document.createElement('div'), {className:'classification-badge-wrapper absolute z-30'});
       const n = 2.0;
       Object.assign(w.style, {
         left: `${col === 7 ? col*12.5+n : (col+1)*12.5-n}%`,
@@ -1309,10 +1410,7 @@ HTML = r"""
       if (!bb || !tc || !tx) return;
       
       if (score == null) {
-        if (isCalculating) {
-          tx.style.opacity = '0.4';
-          return;
-        }
+        if (isCalculating) { tx.style.opacity = '0.4'; return; }
         Object.assign(bb.style, {height:'50%'}); Object.assign(tc.style, {top:'50%', transform:'translate(-50%,6px)'});
         tx.innerText = '0.0'; tx.style.color = '#0a0a0a'; tx.style.opacity = '1';
         return;
@@ -1336,14 +1434,15 @@ HTML = r"""
         } else {
           badge.classList.remove('hidden');
           badge.innerText = `${pciTier} (${pciScore}%)`;
-          if (pciTier === "Maneuvering") {
-            badge.className = 'px-2 py-0.5 rounded-full text-[10px] font-black uppercase tracking-wider bg-neutral-900 border border-neutral-700 text-neutral-400';
+          const cls = 'px-2 py-0.5 rounded-full text-[10px] font-black uppercase tracking-wider whitespace-nowrap ';
+          if (pciTier === "Quiet") {
+            badge.className = cls + 'bg-neutral-900 border border-neutral-700 text-neutral-400';
           } else if (pciTier === "Strategic") {
-            badge.className = 'px-2 py-0.5 rounded-full text-[10px] font-black uppercase tracking-wider bg-emerald-950/40 border border-emerald-500/30 text-emerald-400';
+            badge.className = cls + 'bg-emerald-950/40 border border-emerald-500/30 text-emerald-400';
           } else if (pciTier === "Sharp") {
-            badge.className = 'px-2 py-0.5 rounded-full text-[10px] font-black uppercase tracking-wider bg-amber-950/40 border border-amber-500/30 text-amber-400';
-          } else { // Volatile
-            badge.className = 'px-2 py-0.5 rounded-full text-[10px] font-black uppercase tracking-wider bg-red-950/40 border border-red-500/30 text-red-400';
+            badge.className = cls + 'bg-amber-950/40 border border-amber-500/30 text-amber-400';
+          } else {
+            badge.className = cls + 'bg-red-950/40 border border-red-500/30 text-red-400';
           }
         }
       }
@@ -1375,116 +1474,103 @@ HTML = r"""
         const wb = $(`${idName}-bar-white`);
         const bb = $(`${idName}-bar-black`);
         if (wb && bb) {
-          if (val >= 0) {
-            wb.style.width = `${pct}%`;
-            bb.style.width = '0%';
-          } else {
-            bb.style.width = `${pct}%`;
-            wb.style.width = '0%';
-          }
+          if (val >= 0) { wb.style.width = `${pct}%`; bb.style.width = '0%'; } 
+          else { bb.style.width = `${pct}%`; wb.style.width = '0%'; }
         }
       });
     };
 
-    const updateWppUI = wpp => {
-      const badge = $('wpp-badge');
-      const badgeText = $('wpp-badge-text');
+    const updateWppUI = (wpp, isLoading = false) => {
       const listEl = $('wpp-list');
-      if (!badge || !badgeText || !listEl) return;
+      const cardEl = $('wpp-card');
+      if (!listEl || !cardEl) return;
       
       if (wpp && wpp.worst_pieces_list && wpp.worst_pieces_list.length > 0) {
-        badge.classList.remove('hidden');
-        badgeText.innerText = `Worst Pieces (${wpp.worst_pieces_list.length})`;
+        cardEl.classList.remove('hidden');
         
-        // Populate the dropdown list
         listEl.innerHTML = wpp.worst_pieces_list.map(item => {
           const pct = Math.round(item.mobility_ratio * 100);
-          const isActive = activeWppPaths.has(item.wpp_square);
-          const hasPath = item.maneuver_path && item.maneuver_path.length >= 2;
+          const isActive = showAllManeuvers || activeWppPaths.has(item.wpp_square);
           
           return `
-            <div class="p-2 rounded-lg bg-neutral-800/40 border ${isActive ? 'border-blue-500/50 bg-blue-950/20' : 'border-neutral-700/40'} hover:bg-neutral-800/80 transition-all cursor-pointer flex flex-col gap-1" onclick="toggleSingleWppPath('${item.wpp_square}')">
+            <div class="py-1.5 px-2.5 rounded-xl bg-[#1d1d21]/50 border ${isActive ? 'border-blue-500/40 bg-blue-950/15' : 'border-neutral-800/40'} hover:bg-neutral-800/40 transition-all cursor-pointer flex flex-col gap-0.5" onclick="toggleSingleWppPath('${item.wpp_square}')">
               <div class="flex items-center justify-between">
                 <div class="flex items-center gap-1.5 font-sans">
                   <span class="w-2 h-2 rounded-full ${isActive ? 'bg-blue-400 animate-pulse' : 'bg-neutral-600'}"></span>
                   <span class="text-xs font-bold text-neutral-200">${item.wpp_name}</span>
                 </div>
-                <span class="text-[10px] px-1.5 py-0.5 rounded bg-neutral-900 text-neutral-400 font-semibold">${pct}% active</span>
+                <span class="text-[10px] px-1.5 py-0.5 rounded bg-[#131316] text-neutral-400 font-semibold">${pct}% active</span>
               </div>
-              ${hasPath ? `
-                <div class="text-[10px] text-neutral-400 flex items-center gap-1 mt-0.5 font-mono">
-                  <span class="text-blue-400 font-semibold">Path:</span>
-                  <span>${item.maneuver_path.join(' ➔ ')}</span>
-                </div>
-              ` : `
-                <div class="text-[10px] text-neutral-500 italic mt-0.5">No safe improvement path found</div>
-              `}
+              <div class="text-[10px] text-neutral-400 flex items-center gap-1 mt-0.5 font-mono">
+                <span class="text-blue-400 font-semibold">Path:</span>
+                <span>${item.maneuver_path.join(' ➔ ')}</span>
+              </div>
             </div>
           `;
         }).join('');
-      } else if (wpp && wpp.wpp_name) {
-        // Fallback for single wpp format
-        badge.classList.remove('hidden');
-        badgeText.innerText = `Worst Piece: ${wpp.wpp_name}`;
-        
-        const pct = Math.round(wpp.mobility_ratio * 100);
-        const isActive = showWppPath;
-        const hasPath = wpp.maneuver_path && wpp.maneuver_path.length >= 2;
-        
-        listEl.innerHTML = `
-          <div class="p-2 rounded-lg bg-neutral-800/40 border ${isActive ? 'border-blue-500/50 bg-blue-950/20' : 'border-neutral-700/40'} hover:bg-neutral-800/80 transition-all cursor-pointer flex flex-col gap-1" onclick="toggleWppPath()">
-            <div class="flex items-center justify-between">
-              <div class="flex items-center gap-1.5 font-sans">
-                <span class="w-2 h-2 rounded-full ${isActive ? 'bg-blue-400 animate-pulse' : 'bg-neutral-600'}"></span>
-                <span class="text-xs font-bold text-neutral-200">${wpp.wpp_name}</span>
-              </div>
-              <span class="text-[10px] px-1.5 py-0.5 rounded bg-neutral-900 text-neutral-400 font-semibold">${pct}% active</span>
-            </div>
-            ${hasPath ? `
-              <div class="text-[10px] text-neutral-400 flex items-center gap-1 mt-0.5 font-mono">
-                <span class="text-blue-400 font-semibold">Path:</span>
-                <span>${wpp.maneuver_path.join(' ➔ ')}</span>
-              </div>
-            ` : `
-              <div class="text-[10px] text-neutral-500 italic mt-0.5">No safe improvement path found</div>
-            `}
-          </div>
-        `;
       } else {
-        badge.classList.add('hidden');
-        const dropdown = $('wpp-dropdown');
-        if (dropdown) dropdown.classList.add('hidden');
-      }
-    };
-
-    const toggleWppPath = () => {
-      showWppPath = !showWppPath;
-      if (states[currentIndex] && states[currentIndex].worst_placed_piece) {
-        updateWppUI(states[currentIndex].worst_placed_piece);
-      }
-      updateMarkings(states[currentIndex]);
-    };
-
-    const toggleWppDropdown = () => {
-      const dropdown = $('wpp-dropdown');
-      if (dropdown) {
-        dropdown.classList.toggle('hidden');
-        if (!dropdown.classList.contains('hidden') && states[currentIndex]) {
-          updateWppUI(states[currentIndex].worst_placed_piece);
+        cardEl.classList.remove('hidden');
+        if (isLoading) {
+          listEl.innerHTML = `<div class="flex flex-col items-center justify-center h-full text-neutral-500 text-xs font-sans animate-pulse"><i data-lucide="loader-2" class="w-4 h-4 text-neutral-500 animate-spin mb-1"></i><span>Analyzing position...</span></div>`;
+        } else {
+          listEl.innerHTML = `<div class="flex flex-col items-center justify-center h-full text-neutral-500 text-xs font-sans text-center px-2">No worst-placed pieces detected. Position is balanced.</div>`;
         }
+        lucide.createIcons();
       }
     };
+
+    const toggleWppDropdown = () => {};
 
     const toggleSingleWppPath = sq => {
-      if (activeWppPaths.has(sq)) {
-        activeWppPaths.delete(sq);
-      } else {
-        activeWppPaths.add(sq);
+      if (activeWppPaths.has(sq)) activeWppPaths.delete(sq);
+      else activeWppPaths.add(sq);
+      
+      if (states[currentIndex]) {
+        updateWppUI(states[currentIndex].worst_placed_piece);
+        updateMarkings(states[currentIndex]);
+      }
+    };
+
+    const toggleAllManeuvers = () => {
+      showAllManeuvers = !showAllManeuvers;
+      const btn = $('toggle-all-maneuvers-btn');
+      if (btn) {
+        if (showAllManeuvers) {
+          btn.className = 'px-2 py-0.5 rounded-md bg-blue-950/40 text-blue-400 border border-blue-500/30 text-[9px] font-bold uppercase tracking-wider hover:bg-blue-900/40 transition-all flex items-center gap-1 shrink-0';
+          btn.innerHTML = `<i data-lucide="eye-off" class="w-3 h-3"></i> Maneuvers`;
+        } else {
+          btn.className = 'px-2 py-0.5 rounded-md bg-[#202226] border border-neutral-800/80 text-[9px] font-bold uppercase tracking-wider text-neutral-300 hover:bg-[#282a2f] hover:text-white transition-all flex items-center gap-1 shrink-0';
+          btn.innerHTML = `<i data-lucide="eye" class="w-3 h-3 text-blue-400"></i> Maneuvers`;
+        }
+        lucide.createIcons();
       }
       if (states[currentIndex]) {
         updateWppUI(states[currentIndex].worst_placed_piece);
         updateMarkings(states[currentIndex]);
       }
+    };
+
+    const toggleAnalysisColumn = () => {
+      analysisExpanded = !analysisExpanded;
+      const col = $('analysis-col');
+      const btn = $('toggle-analysis-btn');
+      if (!col || !btn) return;
+
+      if (analysisExpanded && activeTab === 'game') {
+        col.classList.remove('hidden');
+      } else {
+        col.classList.add('hidden');
+      }
+
+      if (analysisExpanded) {
+        btn.classList.remove('opacity-60');
+        btn.innerHTML = `<i data-lucide="bar-chart-2" class="w-4 h-4 text-emerald-400"></i> <span>Metrics</span>`;
+      } else {
+        btn.classList.add('opacity-60');
+        btn.innerHTML = `<i data-lucide="bar-chart-2" class="w-4 h-4 text-neutral-500"></i> <span>Metrics</span>`;
+      }
+      lucide.createIcons();
+      ground && ground.redrawAll();
     };
 
     const navigate = d => {
@@ -1507,8 +1593,18 @@ HTML = r"""
     }`;
 
     const switchTab = id => {
+      activeTab = id;
       $$('.tab-content').forEach(c => { const on = c.id===`${id}-tab`; c.classList.toggle('hidden', !on); c.classList.toggle('flex', on); });
       $$('.tab-btn').forEach(b => { b.className = tabClass(b.dataset.tab === id); });
+
+      const col = $('analysis-col');
+      if (col) {
+        if (activeTab === 'game' && analysisExpanded) {
+          col.classList.remove('hidden');
+        } else {
+          col.classList.add('hidden');
+        }
+      }
     };
 
     const moveEl = (s, idx, active) => {
@@ -1520,12 +1616,9 @@ HTML = r"""
 
     const renderMoveList = () => {
       const c = $('move-list'); if (!c) return;
-      const op = states[currentIndex].opening_name || lastOpening(currentIndex);
-      const startAct = currentIndex===0 ? 'bg-[#32363e] border-neutral-600 text-white font-bold' : 'bg-[#2b2d31] hover:bg-[#35373c] border-neutral-700/80 text-neutral-300';
-      const header = `<div class="flex items-center gap-2 mb-4 pb-3 border-b border-neutral-700 shrink-0"><div class="flex-1 min-w-0 flex items-center gap-2 bg-[#1c1c21] border border-neutral-700/60 rounded-lg px-3 py-1.5"><i data-lucide="book-open" class="w-3.5 h-3.5 text-emerald-400 shrink-0"></i><span id="opening-name" class="font-semibold text-white text-xs truncate">${op}</span></div><button onclick="navigate(0)" data-state-index="0" class="flex items-center gap-1.5 px-3 py-1.5 rounded-lg font-bold text-xs transition-all border shrink-0 ${startAct}"><i data-lucide="chevrons-left" class="w-3.5 h-3.5"></i> Start</button></div>`;
 
       if (states.length <= 1) {
-        c.innerHTML = header + `<div class="flex flex-col items-center justify-center text-center py-12 px-6 h-full text-neutral-400 my-auto"><i data-lucide="git-commit" class="w-16 h-16 mb-4 text-neutral-500 shrink-0"></i><h3 class="text-sm font-bold text-white mb-1">No moves played yet</h3><p class="text-xs max-w-[250px] leading-relaxed">Make moves on the board or import a PGN game.</p></div>`;
+        c.innerHTML = `<div class="flex flex-col items-center justify-center text-center py-12 px-6 h-full text-neutral-400 my-auto"><i data-lucide="git-commit" class="w-16 h-16 mb-4 text-neutral-500 shrink-0"></i><h3 class="text-sm font-bold text-white mb-1">No moves played yet</h3><p class="text-xs max-w-[250px] leading-relaxed">Make moves on the board or import a PGN game.</p></div>`;
         lucide.createIcons(); renderStats(); return;
       }
 
@@ -1536,7 +1629,7 @@ HTML = r"""
         items += `<div class="text-neutral-500 font-mono text-xs sm:text-sm font-black text-right self-center pr-1.5 select-none">${i}.</div><div class="min-w-0">${moveEl(states[w], w, currentIndex===w)}</div><div class="min-w-0">${states[b] ? moveEl(states[b], b, currentIndex===b) : '<div class="w-full"></div>'}</div>`;
       }
 
-      c.innerHTML = header + `<div class="overflow-y-auto flex-1 pr-1.5"><div class="grid grid-cols-[24px_1fr_1fr] gap-x-2.5 gap-y-2 items-center">${items}</div></div>`;
+      c.innerHTML = `<div class="overflow-y-auto flex-1 pr-1.5"><div class="grid grid-cols-[24px_1fr_1fr] gap-x-2.5 gap-y-2 items-center">${items}</div></div>`;
       lucide.createIcons(); renderStats();
       setTimeout(() => { const a=c.querySelector('[data-active="true"]'); a && a.scrollIntoView({behavior:'smooth',block:'nearest'}); }, 50);
     };
@@ -1656,7 +1749,7 @@ HTML = r"""
     $('tab-bar').innerHTML = TABS.map(t => `<button class="${tabClass(t.active)}" data-tab="${t.id}" onclick="switchTab('${t.id}')">${t.label}</button>`).join('');
     $('kbd-help').innerHTML = SHORTCUTS.map(([k,v]) => `<div class="flex justify-between items-center border-b border-neutral-800/20 pb-1.5"><span class="kbd">${k}</span><span class="text-[10px]">${v}</span></div>`).join('');
 
-    Object.assign(window, {navigate, toggleBoardOrientation, confirmReset, switchTab, loadCustomFen, copyCurrentFen, copyCurrentPgn, importPgn, selectMetric, toggleWppPath, toggleWppDropdown, toggleSingleWppPath});
+    Object.assign(window, {navigate, toggleBoardOrientation, confirmReset, switchTab, loadCustomFen, copyCurrentFen, copyCurrentPgn, importPgn, selectMetric, toggleWppDropdown, toggleSingleWppPath, toggleAllManeuvers, toggleAnalysisColumn, toggleMute});
 
     const keyActions = {
       arrowleft:()=>navigate('back'), pageup:()=>navigate('back'), backspace:()=>navigate('back'),
@@ -1672,16 +1765,6 @@ HTML = r"""
     });
     $('fen-input').addEventListener('keydown', e => e.key==='Enter' && loadCustomFen());
     window.addEventListener('resize', () => { ground && ground.redrawAll(); updateMarkings(states[currentIndex]); });
-
-    window.addEventListener('click', e => {
-      const dropdown = $('wpp-dropdown');
-      const badge = $('wpp-badge');
-      if (dropdown && !dropdown.classList.contains('hidden')) {
-        if (!dropdown.contains(e.target) && !badge.contains(e.target) && !badge.querySelector('*')?.contains(e.target)) {
-          dropdown.classList.add('hidden');
-        }
-      }
-    });
 
     const getSquareCenter = (square, rect, o) => {
       const col = square.charCodeAt(0) - 97;
@@ -1720,12 +1803,8 @@ HTML = r"""
       const rect = el.getBoundingClientRect();
       let left = x + 15;
       let top = y + 15;
-      if (left + rect.width > window.innerWidth) {
-        left = x - rect.width - 15;
-      }
-      if (top + rect.height > window.innerHeight) {
-        top = y - rect.height - 15;
-      }
+      if (left + rect.width > window.innerWidth) left = x - rect.width - 15;
+      if (top + rect.height > window.innerHeight) top = y - rect.height - 15;
       el.style.left = `${left}px`;
       el.style.top = `${top}px`;
     };
@@ -1738,44 +1817,27 @@ HTML = r"""
     $('board').addEventListener('mousemove', e => {
       const markings = window.currentBoardMarkings || [];
       const rect = $('board').getBoundingClientRect();
-      if (!maxDistSquare(e, rect)) {
-        hideTooltip();
-        return;
-      }
+      if (!maxDistSquare(e, rect)) { hideTooltip(); return; }
       
       const o = ground.state.orientation === 'white';
-      const mx = e.clientX;
-      const my = e.clientY;
-      
-      let closestMarking = null;
-      let minDist = Infinity;
+      const mx = e.clientX, my = e.clientY;
+      let closestMarking = null, minDist = Infinity;
       
       markings.forEach(m => {
         if (!m.reason) return;
-        
         const centerOrig = getSquareCenter(m.orig, rect, o);
         if (m.dest) {
           const centerDest = getSquareCenter(m.dest, rect, o);
           const d = distToSegment(mx, my, centerOrig.x, centerOrig.y, centerDest.x, centerDest.y);
-          if (d < minDist) {
-            minDist = d;
-            closestMarking = m;
-          }
+          if (d < minDist) { minDist = d; closestMarking = m; }
         } else {
           const d = Math.hypot(mx - centerOrig.x, my - centerOrig.y);
-          if (d < minDist) {
-            minDist = d;
-            closestMarking = m;
-          }
+          if (d < minDist) { minDist = d; closestMarking = m; }
         }
       });
       
-      const threshold = 24;
-      if (closestMarking && minDist < threshold) {
-        showTooltip(closestMarking.reason, mx, my);
-      } else {
-        hideTooltip();
-      }
+      if (closestMarking && minDist < 24) showTooltip(closestMarking.reason, mx, my);
+      else hideTooltip();
     });
 
     function maxDistSquare(e, rect) {
@@ -1785,7 +1847,7 @@ HTML = r"""
 
     $('board').addEventListener('mouseleave', hideTooltip);
 
-    reset(); chess = new Chess(); initBoard(); updateBoard(); lucide.createIcons();
+    reset(); chess = new Chess(); initBoard(); updateBoard(); lucide.createIcons(); audio.init();
   </script>
 </body>
 </html>
